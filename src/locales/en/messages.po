@@ -1,0 +1,144 @@
+msgid ""
+msgstr ""
+"POT-Creation-Date: 2026-08-06 14:04+0800\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"X-Generator: @lingui/cli\n"
+"Language: en\n"
+
+#. placeholder {0}: batch.patchesFound
+#: src/components/batch-list.tsx
+msgid "{0} checked"
+msgstr "{0} checked"
+
+#. placeholder {0}: batch.corrupted.length
+#: src/components/batch-list.tsx
+msgid "{0} corrupted"
+msgstr "{0} corrupted"
+
+#. placeholder {0}: batch.skipped
+#: src/components/batch-list.tsx
+msgid "{0} skipped"
+msgstr "{0} skipped"
+
+#. placeholder {0}: config.unitCount
+#: src/routes/settings.tsx
+msgid "{0} unit resources indexed"
+msgstr "{0} unit resources indexed"
+
+#. placeholder {0}: batch.updated
+#: src/components/batch-list.tsx
+msgid "{0} updated"
+msgstr "{0} updated"
+
+#: src/routes/settings.tsx
+msgid "Accent"
+msgstr "Accent"
+
+#: src/components/dropzone.tsx
+msgid "Add folder"
+msgstr "Add folder"
+
+#: src/routes/settings.tsx
+msgid "Appearance"
+msgstr "Appearance"
+
+#: src/routes/settings.tsx
+msgid "Change…"
+msgstr "Change…"
+
+#. placeholder {0}: batch.checked
+#. placeholder {1}: batch.patchesFound
+#: src/components/batch-list.tsx
+msgid "Checked {0} of {1}"
+msgstr "Checked {0} of {1}"
+
+#: src/routes/settings.tsx
+msgid "Choose a theme and accent color."
+msgstr "Choose a theme and accent color."
+
+#: src/components/batch-list.tsx
+msgid "Corrupted files"
+msgstr "Corrupted files"
+
+#: src/components/batch-list.tsx
+msgid "Done"
+msgstr "Done"
+
+#: src/components/dropzone.tsx
+msgid "Drag a mod folder here, or"
+msgstr "Drag a mod folder here, or"
+
+#: src/routes/home.tsx
+msgid "Drop a mod folder to update its unit resources against the current game data."
+msgstr "Drop a mod folder to update its unit resources against the current game data."
+
+#: src/routes/settings.tsx
+msgid "Game data folder"
+msgstr "Game data folder"
+
+#: src/routes/root.tsx
+msgid "Game data ready"
+msgstr "Game data ready"
+
+#: src/routes/root.tsx
+msgid "Game path not set"
+msgstr "Game path not set"
+
+#: src/routes/root.tsx
+msgid "Home"
+msgstr "Home"
+
+#: src/routes/settings.tsx
+msgid "Indexing game data…"
+msgstr "Indexing game data…"
+
+#: src/routes/settings.tsx
+msgid "Invalid"
+msgstr "Invalid"
+
+#: src/routes/home.tsx
+msgid "No valid Helldivers II game data folder is set. Set it in <0>Settings</0> before repatching."
+msgstr "No valid Helldivers II game data folder is set. Set it in <0>Settings</0> before repatching."
+
+#: src/components/batch-list.tsx
+msgid "No work yet. Drop a mod folder above to start repatching."
+msgstr "No work yet. Drop a mod folder above to start repatching."
+
+#: src/components/batch-list.tsx
+msgid "Pending"
+msgstr "Pending"
+
+#: src/routes/home.tsx
+msgid "Repatch mods"
+msgstr "Repatch mods"
+
+#: src/components/batch-list.tsx
+msgid "Repatching"
+msgstr "Repatching"
+
+#: src/routes/root.tsx
+#: src/routes/settings.tsx
+msgid "Settings"
+msgstr "Settings"
+
+#: src/routes/settings.tsx
+msgid "The Helldivers II `data` folder used as the source of current unit data."
+msgstr "The Helldivers II `data` folder used as the source of current unit data."
+
+#: src/routes/settings.tsx
+msgid "Theme"
+msgstr "Theme"
+
+#: src/routes/root.tsx
+msgid "Unit mod repatcher"
+msgstr "Unit mod repatcher"
+
+#: src/routes/settings.tsx
+msgid "Valid"
+msgstr "Valid"
+
+#: src/routes/home.tsx
+msgid "Work"
+msgstr "Work"

@@ -1,0 +1,48 @@
+{
+  "name": "hd2-repatcher",
+  "private": true,
+  "version": "0.4.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "app": "tauri dev",
+    "app:build": "tauri build",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "lingui:extract": "lingui extract",
+    "lingui:compile": "lingui compile"
+  },
+  "dependencies": {
+    "@lingui/core": "^6",
+    "@lingui/react": "^6",
+    "@tanstack/react-router": "^1",
+    "react": "^19",
+    "react-dom": "^19",
+    "zustand": "^5"
+  },
+  "devDependencies": {
+    "@babel/core": "^7",
+    "@biomejs/biome": "^2",
+    "@lingui/babel-plugin-lingui-macro": "^6",
+    "@lingui/cli": "^6",
+    "@lingui/format-po": "^6",
+    "@lingui/vite-plugin": "^6",
+    "@rolldown/plugin-babel": "^0.2",
+    "@tailwindcss/vite": "^4",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/cli": "^2",
+    "@tauri-apps/plugin-dialog": "^2",
+    "@types/babel__core": "^7",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^6",
+    "babel-plugin-react-compiler": "^1",
+    "tailwindcss": "^4",
+    "typescript": "^7",
+    "vite": "^8"
+  }
+}

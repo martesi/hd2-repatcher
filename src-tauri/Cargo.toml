@@ -1,0 +1,30 @@
+[package]
+name = "hd2-repatcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Repatches Helldivers II unit mods after a game update (GUI + CLI)"
+default-run = "hd2-repatcher"
+
+[[bin]]
+name = "hd2-repatcher"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+rayon = { workspace = true }
+engine = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_Console",
+] }

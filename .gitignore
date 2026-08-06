@@ -1,10 +1,26 @@
+# Node / frontend
+node_modules/
+dist/
+*.tsbuildinfo
+.vite/
+
+# Rust
+target/
+src-tauri/target/
+
+# Tauri generated
+src-tauri/gen/
+
+# Python (reference/)
 __pycache__/
 *.pyc
 .venv/
 *.egg-info/
 .pytest_cache/
 
-# PyInstaller build output
-build/
-dist/
-*.spec
+# Nix
+.direnv/
+result
+
+# OS
+.DS_Store

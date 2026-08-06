@@ -5,17 +5,46 @@ on:
   pull_request:
 
 jobs:
-  test:
-    runs-on: windows-latest
+  engine:
+    name: Rust engine (differential + unit tests)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+      # The engine crate has no Tauri/system deps, so it tests fast and in isolation.
+      - name: cargo test -p engine
+        run: cargo test -p engine
 
+  golden-freshness:
+    name: Golden fixtures match the Python oracle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
+      # Regenerate fixtures from the reference engine and fail if they drifted
+      # from what is committed (no lz4 needed; the generator stubs it).
+      - name: Regenerate golden fixtures
+        run: python tools/gen_golden.py
+      - name: Assert fixtures unchanged
+        run: git diff --exit-code crates/engine/tests/fixtures
 
-      - name: Install dependencies
-        run: pip install -e .[test]
-
-      - name: Run tests
-        run: pytest
+  frontend:
+    name: Frontend (build, typecheck, lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - name: Biome
+        run: bunx biome ci .
+      - name: Typecheck (TypeScript 7)
+        run: bunx tsc --noEmit
+      - name: Build
+        run: bun run build
