@@ -13,6 +13,7 @@ export type Batch = {
   checked: number
   updated: number
   skipped: number
+  audio: number
   corrupted: string[]
 }
 
@@ -47,6 +48,7 @@ export const useStore = create<State>((set) => ({
       checked: 0,
       updated: 0,
       skipped: 0,
+      audio: 0,
       corrupted: [],
     }
     set((s) => ({ batches: [batch, ...s.batches] }))
@@ -63,6 +65,7 @@ export const useStore = create<State>((set) => ({
               checked: p.checked,
               updated: p.updated,
               skipped: p.skipped,
+              audio: p.audio,
               corrupted: p.corrupted,
             }
           : b

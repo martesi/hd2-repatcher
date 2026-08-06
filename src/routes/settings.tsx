@@ -5,7 +5,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { useStore } from '@/lib/store'
-import { api, pickFolder } from '@/lib/tauri'
+import { api, pickFile, pickFolder } from '@/lib/tauri'
 import { cn } from '@/lib/utils'
 
 const THEMES: Theme[] = ['light', 'dark', 'system']
@@ -38,6 +38,18 @@ export function Settings() {
         setBusy(false)
       }
     }
+  }
+
+  async function changeAudioTool() {
+    const path = await pickFile('Select the audio tool executable')
+    if (!path) return
+    const valid = await api.setAudioToolPath(path)
+    patchConfig({ audioToolPath: path, audioToolValid: valid })
+  }
+
+  async function clearAudioTool() {
+    await api.clearAudioToolPath()
+    patchConfig({ audioToolPath: null, audioToolValid: false })
   }
 
   return (
@@ -85,6 +97,47 @@ export function Settings() {
                   <Trans>{config.unitCount} unit resources indexed</Trans>
                 </span>
               )
+            )}
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>
+            <Trans>Audio tool</Trans>
+          </CardTitle>
+          <CardDescription>
+            <Trans>
+              The external audio modding tool used to repatch audio mods, which this app cannot
+              repatch itself. Optional — leave it unset if you have no audio mods.
+            </Trans>
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          <div className="flex items-center gap-2">
+            <code className="min-w-0 flex-1 truncate rounded-md bg-muted px-3 py-2 text-xs">
+              {config?.audioToolPath ?? '—'}
+            </code>
+            {config?.audioToolPath &&
+              (config.audioToolValid ? (
+                <Badge variant="success">
+                  <Trans>Valid</Trans>
+                </Badge>
+              ) : (
+                <Badge variant="destructive">
+                  <Trans>Missing</Trans>
+                </Badge>
+              ))}
+          </div>
+          <div className="flex items-center gap-3">
+            <Button variant="outline" onClick={changeAudioTool}>
+              <Trans>Change…</Trans>
+            </Button>
+            {config?.audioToolPath && (
+              <Button variant="ghost" onClick={clearAudioTool}>
+                <Trans>Clear</Trans>
+              </Button>
             )}
           </div>
         </CardContent>

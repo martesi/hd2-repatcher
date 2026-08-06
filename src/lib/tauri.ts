@@ -6,6 +6,8 @@ import { open } from '@tauri-apps/plugin-dialog'
 export type AppConfig = {
   gameDataPath: string | null
   gameDataValid: boolean
+  audioToolPath: string | null
+  audioToolValid: boolean
   theme: string | null
   accent: string | null
   unitCount: number
@@ -18,6 +20,7 @@ export type BatchProgress = {
   checked: number
   updated: number
   skipped: number
+  audio: number
   corrupted: string[]
 }
 
@@ -27,12 +30,15 @@ export type BatchResult = {
   patchesFound: number
   updated: number
   skipped: number
+  audio: number
   corrupted: string[]
 }
 
 export const api = {
   getConfig: () => invoke<AppConfig>('get_config'),
   setGamePath: (path: string) => invoke<boolean>('set_game_path', { path }),
+  setAudioToolPath: (path: string) => invoke<boolean>('set_audio_tool_path', { path }),
+  clearAudioToolPath: () => invoke<void>('clear_audio_tool_path'),
   setTheme: (theme: string) => invoke<void>('set_theme', { theme }),
   setAccent: (accent: string) => invoke<void>('set_accent', { accent }),
   initGameResources: (path: string) => invoke<number>('init_game_resources', { path }),
@@ -43,6 +49,12 @@ export const api = {
 /** Opens the native folder picker; returns the chosen absolute path or null. */
 export async function pickFolder(title: string): Promise<string | null> {
   const selected = await open({ directory: true, multiple: false, title })
+  return typeof selected === 'string' ? selected : null
+}
+
+/** Opens the native file picker; returns the chosen absolute path or null. */
+export async function pickFile(title: string): Promise<string | null> {
+  const selected = await open({ directory: false, multiple: false, title })
   return typeof selected === 'string' ? selected : null
 }
 

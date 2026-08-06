@@ -42,6 +42,8 @@ pub fn run(cli_paths: Vec<String>) {
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
             commands::set_game_path,
+            commands::set_audio_tool_path,
+            commands::clear_audio_tool_path,
             commands::set_theme,
             commands::set_accent,
             commands::init_game_resources,

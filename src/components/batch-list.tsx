@@ -78,6 +78,11 @@ function BatchItem({ batch }: { batch: Batch }) {
           <span>
             <Trans>{batch.skipped} skipped</Trans>
           </span>
+          {batch.audio > 0 && (
+            <span className="text-[var(--success)]">
+              <Trans>{batch.audio} audio delegated</Trans>
+            </span>
+          )}
           {batch.corrupted.length > 0 && (
             <span className="text-destructive">
               <Trans>{batch.corrupted.length} corrupted</Trans>

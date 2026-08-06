@@ -6,6 +6,17 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "X-Generator: @lingui/cli\n"
 "Language: en\n"
+"Project-Id-Version: \n"
+"Report-Msgid-Bugs-To: \n"
+"PO-Revision-Date: \n"
+"Last-Translator: \n"
+"Language-Team: \n"
+"Plural-Forms: \n"
+
+#. placeholder {0}: batch.audio
+#: src/components/batch-list.tsx
+msgid "{0} audio delegated"
+msgstr "{0} audio delegated"
 
 #. placeholder {0}: batch.patchesFound
 #: src/components/batch-list.tsx
@@ -45,6 +56,10 @@ msgid "Appearance"
 msgstr "Appearance"
 
 #: src/routes/settings.tsx
+msgid "Audio tool"
+msgstr "Audio tool"
+
+#: src/routes/settings.tsx
 msgid "Change…"
 msgstr "Change…"
 
@@ -57,6 +72,10 @@ msgstr "Checked {0} of {1}"
 #: src/routes/settings.tsx
 msgid "Choose a theme and accent color."
 msgstr "Choose a theme and accent color."
+
+#: src/routes/settings.tsx
+msgid "Clear"
+msgstr "Clear"
 
 #: src/components/batch-list.tsx
 msgid "Corrupted files"
@@ -98,6 +117,10 @@ msgstr "Indexing game data…"
 msgid "Invalid"
 msgstr "Invalid"
 
+#: src/routes/settings.tsx
+msgid "Missing"
+msgstr "Missing"
+
 #: src/routes/home.tsx
 msgid "No valid Helldivers II game data folder is set. Set it in <0>Settings</0> before repatching."
 msgstr "No valid Helldivers II game data folder is set. Set it in <0>Settings</0> before repatching."
@@ -122,6 +145,10 @@ msgstr "Repatching"
 #: src/routes/settings.tsx
 msgid "Settings"
 msgstr "Settings"
+
+#: src/routes/settings.tsx
+msgid "The external audio modding tool used to repatch audio mods, which this app cannot repatch itself. Optional — leave it unset if you have no audio mods."
+msgstr "The external audio modding tool used to repatch audio mods, which this app cannot repatch itself. Optional — leave it unset if you have no audio mods."
 
 #: src/routes/settings.tsx
 msgid "The Helldivers II `data` folder used as the source of current unit data."

@@ -11,6 +11,8 @@ use rayon::prelude::*;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::audio;
+
 /// The indexed game data, shared read-only across the batch worker threads.
 #[derive(Default)]
 pub struct AppState {
@@ -25,6 +27,8 @@ pub struct AppState {
 pub struct Config {
     pub game_data_path: Option<String>,
     pub game_data_valid: bool,
+    pub audio_tool_path: Option<String>,
+    pub audio_tool_valid: bool,
     pub theme: Option<String>,
     pub accent: Option<String>,
     /// Number of indexed unit resources (0 until game data is loaded).
@@ -40,6 +44,7 @@ struct BatchProgress {
     checked: usize,
     updated: usize,
     skipped: usize,
+    audio: usize,
     corrupted: Vec<String>,
 }
 
@@ -51,6 +56,7 @@ pub struct BatchResult {
     patches_found: usize,
     updated: usize,
     skipped: usize,
+    audio: usize,
     corrupted: Vec<String>,
 }
 
@@ -72,9 +78,16 @@ pub fn get_config(app: AppHandle) -> Config {
         .as_ref()
         .map(|p| engine::is_valid_game_data_path(Path::new(p)))
         .unwrap_or(false);
+    let audio_tool_valid = s
+        .audio_tool_path
+        .as_ref()
+        .map(|p| Path::new(p).is_file())
+        .unwrap_or(false);
     Config {
         game_data_path: s.game_data_path,
         game_data_valid,
+        audio_tool_path: s.audio_tool_path,
+        audio_tool_valid,
         theme: s.theme,
         accent: s.accent,
         unit_count: current_unit_count(&app),
@@ -90,6 +103,23 @@ pub fn set_game_path(path: String) -> Result<bool, String> {
     s.game_data_path = Some(path);
     settings::save(&s).map_err(|e| e.to_string())?;
     Ok(valid)
+}
+
+/// Persists the external audio tool path. Returns whether it points at an
+/// existing file, which is the same check the CLI makes before delegating.
+#[tauri::command]
+pub fn set_audio_tool_path(path: String) -> Result<bool, String> {
+    let valid = Path::new(&path).is_file();
+    settings::set_cached_audio_tool_path(&path).map_err(|e| e.to_string())?;
+    Ok(valid)
+}
+
+/// Forgets the configured audio tool, returning to the "not configured" state.
+#[tauri::command]
+pub fn clear_audio_tool_path() -> Result<(), String> {
+    let mut s = settings::load();
+    s.audio_tool_path = None;
+    settings::save(&s).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -163,6 +193,7 @@ fn run_batch(app: AppHandle, id: String, path: String, resources: Arc<GameResour
             checked: 0,
             updated: 0,
             skipped: 0,
+            audio: 0,
             corrupted: vec![],
         },
     );
@@ -195,10 +226,39 @@ fn run_batch(app: AppHandle, id: String, path: String, resources: Arc<GameResour
                 checked: done,
                 updated: updated.load(Ordering::Relaxed),
                 skipped: skipped.load(Ordering::Relaxed),
+                audio: 0,
                 corrupted: corrupted.lock().unwrap().clone(),
             },
         );
     });
+
+    // Delegate every directory that directly holds audio patches to the
+    // configured external audio tool, mirroring the CLI's second pass.
+    let audio_dirs = audio::find_audio_dirs(&dir);
+    let mut audio_delegated = 0usize;
+    if !audio_dirs.is_empty() {
+        let s = settings::load();
+        let tool = s.audio_tool_path.map(PathBuf::from).filter(|p| p.is_file());
+        match (tool, s.game_data_path) {
+            (Some(tool), Some(game_path)) => {
+                let game_path = PathBuf::from(game_path);
+                for (adir, patches) in &audio_dirs {
+                    match audio::repatch_audio_dir(&tool, &game_path, adir, patches) {
+                        Ok(_) => audio_delegated += patches.len(),
+                        Err(e) => corrupted.lock().unwrap().push(e),
+                    }
+                }
+            }
+            _ => {
+                let total: usize = audio_dirs.iter().map(|(_, p)| p.len()).sum();
+                corrupted.lock().unwrap().push(format!(
+                    "{total} audio patch file(s) across {} folder(s) found but no audio tool is \
+                     configured; set it in Settings",
+                    audio_dirs.len()
+                ));
+            }
+        }
+    }
 
     let corrupted = corrupted.into_inner().unwrap();
     let status = if corrupted.is_empty() { "done" } else { "error" };
@@ -211,6 +271,7 @@ fn run_batch(app: AppHandle, id: String, path: String, resources: Arc<GameResour
             checked: patches_found,
             updated: updated.load(Ordering::Relaxed),
             skipped: skipped.load(Ordering::Relaxed),
+            audio: audio_delegated,
             corrupted: corrupted.clone(),
         },
     );
@@ -221,6 +282,7 @@ fn run_batch(app: AppHandle, id: String, path: String, resources: Arc<GameResour
         patches_found,
         updated: updated.load(Ordering::Relaxed),
         skipped: skipped.load(Ordering::Relaxed),
+        audio: audio_delegated,
         corrupted,
     }
 }

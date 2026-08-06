@@ -23,6 +23,7 @@ export function Home() {
         checked: 0,
         updated: 0,
         skipped: 0,
+        audio: 0,
         corrupted: [String(err)],
       })
     })
