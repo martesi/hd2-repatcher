@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use engine::{settings, GameResources, PatchResult};
 
+use crate::audio;
+
 pub mod console;
 
 #[derive(Parser, Debug)]
@@ -22,6 +24,20 @@ pub struct Args {
     /// do not save or overwrite the cached game data path
     #[arg(long = "no-game-path-caching")]
     pub no_game_path_caching: bool,
+
+    /// path to the external audio tool executable; also cached for future runs
+    #[arg(long = "audio-tool", value_name = "PATH")]
+    pub audio_tool: Option<String>,
+
+    /// write repatched copies into DIR (one <name> subfolder per input folder)
+    /// instead of modifying the originals in place
+    #[arg(short = 'o', long = "output", value_name = "DIR")]
+    pub output: Option<String>,
+
+    /// operate on a copy, leaving the original mod files untouched; copies land
+    /// in --output, or in a sibling `<name>-repatched/` folder when omitted
+    #[arg(short = 'n', long = "dry-run")]
+    pub dry_run: bool,
 
     /// folder(s) containing patch files to update
     #[arg(value_name = "PATCH_FOLDER")]
@@ -55,10 +71,23 @@ pub fn run(args: Args) -> i32 {
         game_path = Some(p);
     }
 
-    run_cli(game_path, &args.patches)
+    // Resolve + cache the audio tool path (mirrors the -g caching block above).
+    let mut audio_tool: Option<PathBuf> = None;
+    if let Some(t) = &args.audio_tool {
+        let p = absolute(t);
+        if !p.is_file() {
+            eprintln!("error: '{t}' is not an executable file");
+            return 1;
+        }
+        let _ = settings::set_cached_audio_tool_path(&p.to_string_lossy());
+        println!("Audio tool set to: {}", p.display());
+        audio_tool = Some(p);
+    }
+
+    run_cli(game_path, audio_tool, &args)
 }
 
-fn run_cli(game_path: Option<PathBuf>, patch_dirs: &[String]) -> i32 {
+fn run_cli(game_path: Option<PathBuf>, audio_tool: Option<PathBuf>, args: &Args) -> i32 {
     let game_path = match game_path {
         Some(p) => p,
         None => match settings::get_cached_game_data_path() {
@@ -70,28 +99,107 @@ fn run_cli(game_path: Option<PathBuf>, patch_dirs: &[String]) -> i32 {
         },
     };
 
+    // Fall back to the cached audio tool path when the flag was not passed.
+    let audio_tool = audio_tool.or_else(|| {
+        settings::get_cached_audio_tool_path()
+            .map(PathBuf::from)
+            .filter(|p| p.is_file())
+    });
+
     println!("Loading game resources from: {}", game_path.display());
     let resources = GameResources::load(&game_path);
 
     let mut exit_code = 0;
-    for patch_dir in patch_dirs {
-        let p = absolute(patch_dir);
-        if !p.is_dir() {
-            eprintln!("error: '{}' is not a directory", p.display());
+    for patch_dir in &args.patches {
+        let src = absolute(patch_dir);
+        if !src.is_dir() {
+            eprintln!("error: '{}' is not a directory", src.display());
             exit_code = 1;
             continue;
         }
-        let result = engine::process_patch_folder(&p, &resources);
-        print_cli_result(&p, &result);
+
+        // Dry-run / -o operate on a copy so the originals are never touched.
+        let copy = args.dry_run || args.output.is_some();
+        let work_dir = if copy {
+            let dest = output_dest(&src, args.output.as_deref());
+            if dest == src {
+                eprintln!("error: output destination for '{}' resolves to itself", src.display());
+                exit_code = 1;
+                continue;
+            }
+            let _ = std::fs::remove_dir_all(&dest);
+            if let Err(e) = audio::copy_dir_recursive(&src, &dest) {
+                eprintln!("error: {e}");
+                exit_code = 1;
+                continue;
+            }
+            dest
+        } else {
+            src.clone()
+        };
+
+        // 1. Unit patching on the working dir.
+        let result = engine::process_patch_folder(&work_dir, &resources);
         if !result.corrupted_files.is_empty() {
             exit_code = 1;
         }
+
+        // 2. Delegate each directory that directly holds audio patches.
+        let audio_dirs = audio::find_audio_dirs(&work_dir);
+        if !audio_dirs.is_empty() {
+            match &audio_tool {
+                Some(tool) => {
+                    for (dir, patches) in &audio_dirs {
+                        if let Err(e) = audio::repatch_audio_dir(tool, &game_path, dir, patches) {
+                            eprintln!("error: {e}");
+                            exit_code = 1;
+                        }
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "error: '{}' contains {} audio patch folder(s) but no audio tool is \
+                         configured; pass --audio-tool <path>",
+                        src.display(),
+                        audio_dirs.len()
+                    );
+                    exit_code = 1;
+                }
+            }
+        }
+
+        let dest = copy.then(|| work_dir.clone());
+        let delegated = audio_tool.is_some();
+        print_cli_result(&src, dest.as_deref(), &result, &audio_dirs, delegated);
     }
     exit_code
 }
 
-fn print_cli_result(directory: &Path, result: &PatchResult) {
+/// Computes the copy destination for a mod folder: `<output>/<name>` when
+/// `--output` is given, otherwise a sibling `<name>-repatched/`.
+fn output_dest(src: &Path, output: Option<&str>) -> PathBuf {
+    let name = src.file_name().unwrap_or_default();
+    match output {
+        Some(o) => absolute(o).join(name),
+        None => {
+            let mut fname = name.to_os_string();
+            fname.push("-repatched");
+            src.parent().unwrap_or_else(|| Path::new(".")).join(fname)
+        }
+    }
+}
+
+fn print_cli_result(
+    directory: &Path,
+    dest: Option<&Path>,
+    result: &PatchResult,
+    audio_dirs: &[(PathBuf, Vec<PathBuf>)],
+    delegated: bool,
+) {
     println!("\n{}", directory.display());
+    if let Some(dest) = dest {
+        println!("  Repatched copy written to: {}", dest.display());
+    }
     if result.patches_found == 0 {
         println!("  No patch files found.");
         return;
@@ -101,6 +209,22 @@ fn print_cli_result(directory: &Path, result: &PatchResult) {
         "  Updated {} patch file(s) containing unit resources",
         result.updated.len()
     );
+    if !result.audio.is_empty() {
+        if delegated {
+            println!(
+                "  Delegated {} audio patch file(s) across {} folder(s) to the audio tool",
+                result.audio.len(),
+                audio_dirs.len()
+            );
+        } else {
+            println!(
+                "  Found {} audio patch file(s) across {} folder(s) but skipped them \
+                 (no audio tool configured)",
+                result.audio.len(),
+                audio_dirs.len()
+            );
+        }
+    }
     if !result.no_units.is_empty() {
         println!(
             "  Skipped {} patch file(s) with no unit resources",
