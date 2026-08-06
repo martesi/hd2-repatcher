@@ -4,6 +4,11 @@ dist/
 *.tsbuildinfo
 .vite/
 
+# Lingui: .po catalogs are imported directly (@lingui/vite-plugin compiles
+# them on the fly), so `lingui compile` output is a local artifact, not
+# checked in.
+src/locales/*/messages.ts
+
 # Rust
 target/
 src-tauri/target/
