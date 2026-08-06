@@ -10,6 +10,7 @@ src-tauri/target/
 
 # Tauri generated
 src-tauri/gen/
+src-tauri/icons/
 
 # Python (reference/)
 __pycache__/

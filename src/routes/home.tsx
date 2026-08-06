@@ -1,10 +1,11 @@
 import { Trans } from '@lingui/react/macro'
 import { Link } from '@tanstack/react-router'
+import { useEffect } from 'react'
 import { BatchList } from '@/components/batch-list'
 import { Dropzone } from '@/components/dropzone'
 import { AlertIcon } from '@/components/icons'
 import { useStore } from '@/lib/store'
-import { api } from '@/lib/tauri'
+import { api, onCliOpenPaths } from '@/lib/tauri'
 
 export function Home() {
   const batches = useStore((s) => s.batches)
@@ -26,6 +27,23 @@ export function Home() {
       })
     })
   }
+
+  // Patch folders dropped onto the exe: this launch's own argv (pulled once,
+  // since the backend can't reliably push an event before this mounts), plus
+  // any forwarded from a later double-click/drag-drop while we're running.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: run once on mount
+  useEffect(() => {
+    api.takeStartupPaths().then((paths) => {
+      for (const p of paths) handleAdd(p)
+    })
+    let unlisten: (() => void) | undefined
+    onCliOpenPaths((paths) => {
+      for (const p of paths) handleAdd(p)
+    }).then((fn) => {
+      unlisten = fn
+    })
+    return () => unlisten?.()
+  }, [])
 
   return (
     <div className="flex flex-col gap-6">

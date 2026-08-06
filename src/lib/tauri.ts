@@ -37,6 +37,7 @@ export const api = {
   setAccent: (accent: string) => invoke<void>('set_accent', { accent }),
   initGameResources: (path: string) => invoke<number>('init_game_resources', { path }),
   processBatch: (id: string, path: string) => invoke<BatchResult>('process_batch', { id, path }),
+  takeStartupPaths: () => invoke<string[]>('take_startup_paths'),
 }
 
 /** Opens the native folder picker; returns the chosen absolute path or null. */
@@ -60,4 +61,9 @@ export function onFileDrop(cb: (paths: string[]) => void): Promise<UnlistenFn> {
   return getCurrentWebviewWindow().onDragDropEvent((event) => {
     if (event.payload.type === 'drop') cb(event.payload.paths)
   })
+}
+
+/** Patch folders forwarded from a second double-click/drag-drop launch onto the exe. */
+export function onCliOpenPaths(cb: (paths: string[]) => void): Promise<UnlistenFn> {
+  return listen<string[]>('cli://open-paths', (e) => cb(e.payload))
 }

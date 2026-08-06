@@ -15,6 +15,9 @@ use tauri::{AppHandle, Emitter, Manager};
 #[derive(Default)]
 pub struct AppState {
     pub resources: Mutex<Option<Arc<GameResources>>>,
+    /// Patch folder paths passed on argv at launch (double-click/drag-drop
+    /// onto the exe), consumed once by the frontend via `take_startup_paths`.
+    pub startup_paths: Mutex<Vec<String>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -220,6 +223,13 @@ fn run_batch(app: AppHandle, id: String, path: String, resources: Arc<GameResour
         skipped: skipped.load(Ordering::Relaxed),
         corrupted,
     }
+}
+
+/// Returns and clears the patch folder paths seeded at launch (double-click or
+/// drag-drop onto the exe). Called once by the frontend on mount.
+#[tauri::command]
+pub fn take_startup_paths(app: AppHandle) -> Vec<String> {
+    std::mem::take(&mut *app.state::<AppState>().startup_paths.lock().unwrap())
 }
 
 /// Loads the cached game data path (if valid) into state at startup so batches
