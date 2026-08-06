@@ -47,4 +47,4 @@ jobs:
       - name: Typecheck (TypeScript 7)
         run: bunx tsc --noEmit
       - name: Build
-        run: bun run build
+        run: bun run build:web

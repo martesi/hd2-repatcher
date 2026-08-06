@@ -67,11 +67,18 @@ Tauri Linux system libraries:
 ```console
 nix develop
 bun install
-bun run app        # tauri dev — GUI with hot reload
+bun run dev         # tauri dev — GUI with hot reload
 ```
 
-Other scripts: `bun run build` (frontend), `bun run app:build` (bundle the app),
-`bun run typecheck`, `bun run lint`, `bun run lingui:extract` / `lingui:compile`.
+Other scripts: `bun run build:web` (frontend only), `bun run build` (bundle the
+app), `bun run build:cross-compile` (bundle the Windows NSIS installer from
+Linux, via the `windows` dev shell), `bun run check:ts`, `bun run check:rs`,
+`bun run lint`, `bun run check:biome` (format), `bun run check:agent` (runs
+`check:ts` / `check:rs` / `check:biome` concurrently), `bun run lingui:extract`
+(scan source for new/changed messages). `.po` catalogs are imported directly
+in `src/lib/i18n.ts` and compiled on the fly by `@lingui/vite-plugin`, so
+`bun run lingui:compile` isn't part of the normal workflow — it's only useful
+to sanity-check that a catalog compiles cleanly outside of Vite.
 
 ### Architecture
 
@@ -114,5 +121,12 @@ CI builds Windows and Linux installers on tag push
 (`.github/workflows/release.yml`). Locally:
 
 ```console
-bun run app:build
+bun run build
+```
+
+To cross-compile the Windows NSIS installer from Linux (see the `windows` dev
+shell in `flake.nix`):
+
+```console
+bun run build:cross-compile
 ```
