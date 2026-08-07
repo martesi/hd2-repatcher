@@ -104,8 +104,23 @@
           # display that doesn't exist, which fails exactly like an unset
           # DISPLAY - so start Xvfb and wait for it first. The :- guard keeps
           # a real desktop's display, or one you picked yourself.
+          #
+          # FONTCONFIG_FILE matters more than it looks. A slim container has no
+          # /etc/fonts and no font files, so fontconfig finds nothing and the
+          # webview renders every glyph as tofu - screenshots come out
+          # structurally correct and completely unreadable, which is easy to
+          # misread as a rendering bug. makeFontsConf writes a self-contained
+          # config naming these store paths; the env var is required because
+          # fontconfig's compiled-in default (/etc/fonts/fonts.conf) is absent.
+          # DejaVu + Liberation cover the app's locales (en, fr); add noto-fonts
+          # variants here if it ever ships non-Latin catalogs.
           shellHook = tauriHook + ''
             export DISPLAY="''${DISPLAY:-:99}"
+            export FONTCONFIG_FILE="''${FONTCONFIG_FILE:-${
+              pkgs.makeFontsConf {
+                fontDirectories = with pkgs; [ dejavu_fonts liberation_ttf ];
+              }
+            }}"
           '';
         };
 
