@@ -105,13 +105,14 @@ fn golden_fixtures_match_python_oracle() {
         .expect("fixtures dir exists; run `python tools/gen_golden.py`")
         .flatten()
         .map(|e| e.path())
-        // `audio_*`/`hirc_merge_*` fixtures share this directory but belong
-        // to `audio_golden.rs`/`hirc_merge_golden.rs` respectively (see
-        // `tools/gen_audio_golden.py`).
+        // `audio_*`/`hirc_merge_*`/`mod_*` fixtures share this directory but
+        // belong to `audio_golden.rs`/`hirc_merge_golden.rs`/`mod_golden.rs`
+        // respectively (see `tools/gen_audio_golden.py`).
         .filter(|p| {
             p.is_dir()
                 && !p.file_name().unwrap().to_string_lossy().starts_with("audio_")
                 && !p.file_name().unwrap().to_string_lossy().starts_with("hirc_merge_")
+                && !p.file_name().unwrap().to_string_lossy().starts_with("mod_")
         })
         .collect();
     cases.sort();

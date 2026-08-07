@@ -833,8 +833,208 @@ def build_phase4_cases():
     print("Done.")
 
 
+def write_mod_case(name: str, bases: list, patches: list):
+    """Phase 5: exercises the full `Mod` orchestration (`import_patch`,
+    `write_patch`, `write_separate_patches`, `add_game_archive`) rather than
+    a bare `GameArchive` round trip.
+
+    `bases`/`patches`: fully populated `ac.GameArchive`s (not yet
+    serialized, distinct `.name`s). Each is encoded to a real file on disk
+    via the oracle's own encoder (same "legitimate way to manufacture a
+    well-formed input" as `write_case`), then replayed through a fresh
+    `ac.Mod`: every base loaded via `load_archive_file` (sorted by name),
+    then every patch applied via `import_patch` (sorted by name, matching
+    `run_patch_cli`'s `sorted(os.listdir(...))`). Captures both
+    `write_patch` (combined) and `write_separate_patches` (per-base-archive)
+    output for the Rust golden test to replay and byte-diff.
+    """
+    case_dir = FIXTURES / name
+    case_dir.mkdir(parents=True, exist_ok=True)
+    base_dir = case_dir / "base"
+    patch_dir = case_dir / "patches"
+    expected_combined = case_dir / "expected_combined"
+    expected_separate = case_dir / "expected_separate"
+    for d in (base_dir, patch_dir, expected_combined, expected_separate):
+        d.mkdir(exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="hd2-mod-golden-") as tmp:
+        tmp = Path(tmp)
+
+        def encode(archive, subdir):
+            d = tmp / subdir / archive.name
+            d.mkdir(parents=True)
+            archive.to_file(str(d))
+            return d / archive.name
+
+        base_paths = sorted((encode(a, f"base_{a.name}") for a in bases), key=lambda p: p.name)
+        patch_paths = sorted((encode(a, f"patch_{a.name}") for a in patches), key=lambda p: p.name)
+
+        for p in base_paths:
+            for f in p.parent.iterdir():
+                (base_dir / f.name).write_bytes(f.read_bytes())
+        for p in patch_paths:
+            for f in p.parent.iterdir():
+                (patch_dir / f.name).write_bytes(f.read_bytes())
+
+        mod = ac.Mod()
+        for p in base_paths:
+            assert mod.load_archive_file(str(p)), f"[{name}] failed to load base archive {p.name}"
+        for p in patch_paths:
+            assert mod.import_patch(str(p)), f"[{name}] failed to import patch {p.name}"
+
+        combined_dir = tmp / "combined"
+        combined_dir.mkdir()
+        mod.write_patch(str(combined_dir))
+        for f in combined_dir.iterdir():
+            (expected_combined / f.name).write_bytes(f.read_bytes())
+
+        separate_dir = tmp / "separate"
+        separate_dir.mkdir()
+        mod.write_separate_patches(str(separate_dir))
+        for f in separate_dir.iterdir():
+            (expected_separate / f.name).write_bytes(f.read_bytes())
+
+    meta = {
+        "base_names": [p.name for p in base_paths],
+        "patch_names": [p.name for p in patch_paths],
+    }
+    (case_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+    print(f"  {name}: ok")
+
+
+def build_phase5_cases():
+    """Phase 5: full `Mod::import_patch`/`write_patch`/
+    `write_separate_patches`/`add_game_archive` orchestration — wiring
+    phases 1-4 into the real control flow used by a mod-folder patch run,
+    including the audio-swap-must-mark-bank-modified gap and the
+    hierarchy-merge-must-mark-bank-modified gap this phase's implementation
+    found and fixed (see `Mod.import_hierarchy`/`Mod.import_patch`'s
+    `swapped_ids` comments in `reference/audio_core.py`), plus text-bank
+    import and both video branches."""
+    print("Generating phase-5 Mod-orchestration fixtures...")
+
+    # --- Case 1: single base archive + single patch, v154. Exercises audio
+    # byte swap (must mark the owning bank modified even though no HIRC
+    # field changed) *and* a Sound propBundle field-merge (must also mark
+    # the bank modified) *and* a text-bank string change, all landing in the
+    # same bank/archive so both write_patch and write_separate_patches can
+    # be checked against one combined+one per-archive expected output.
+    source_id = 0x9101
+    original_bytes = filler(64, seed=101)
+    new_bytes = filler(48, seed=102)
+
+    base_bp = build_base_param(154)
+    set_prop_bundle(154, base_bp, [1], [b"aaaa"])
+    base_sound = build_sound(154, 0xF001, build_bank_source(154, source_id, len(original_bytes)), base_bp)
+    base1 = base_archive("1111111111111111")
+    bank1 = build_bank(0x9001, [base_sound], version=154)
+    bank1.media_index = [source_id]
+    base1.wwise_banks[0x9001] = bank1
+    base1.audio_sources[source_id] = build_bank_audio_source(source_id, original_bytes)
+    base1.text_banks[0x9002] = build_text_bank(0x9002, 1, {1: "old text"})
+
+    patch_bp = build_base_param(154)
+    set_prop_bundle(154, patch_bp, [9], [b"zzzz"])
+    patch_sound = build_sound(154, 0xF001, build_bank_source(154, source_id, len(new_bytes)), patch_bp)
+    patch1 = base_archive("mod_patch_basic.patch_0")
+    patch_bank1 = build_bank(0x9001, [patch_sound], version=154)
+    patch_bank1.media_index = [source_id]
+    patch1.wwise_banks[0x9001] = patch_bank1
+    patch1.audio_sources[source_id] = build_bank_audio_source(source_id, new_bytes)
+    patch1.text_banks[0x9002] = build_text_bank(0x9002, 1, {1: "new text"})
+
+    write_mod_case("mod_import_patch_basic", bases=[base1], patches=[patch1])
+
+    # --- Case 2: video handling, both branches. Base archive has one
+    # existing video; one patch touches it (merge into the existing pooled
+    # VideoSource), a second patch introduces a wholly new video (added as a
+    # genuinely new resource via add_game_archive). No banks at all, to
+    # prove video-only patches drive `add_patch` on their own.
+    #
+    # Kept as *separate* single-video patch archives rather than one patch
+    # with both: real upstream's `Mod.import_video` (`core.py:2187-2189`)
+    # sets `replacement_video_size` from `os.path.getsize(patch_file+".stream")`
+    # — the *whole* companion `.stream` file's size, not the specific video's
+    # own byte range within it — then only overrides `replacement_video_offset`,
+    # not the size. For a single-video patch this quirk is unobservable (the
+    # oversized read gets clamped to EOF, returning exactly that video's own
+    # bytes); with two videos packed into one `.stream` file it would read
+    # past the first video into the second's bytes. Faithfully replicating
+    # that quirk in the Rust port's eager-byte-slicing `VideoSource` would
+    # mean deliberately reintroducing a real upstream bug into new code — not
+    # worth it for a case this narrow, so the fixture sidesteps it instead of
+    # exercising it.
+    base2 = base_archive("2222222222222222")
+    base2.video_sources[0xA001] = build_video(0xA001, filler(32, seed=201))
+
+    patch2a = base_archive("mod_patch_video_known.patch_0")
+    patch2a.video_sources[0xA001] = build_video(0xA001, filler(32, seed=202))  # existing -> merge branch
+
+    patch2b = base_archive("mod_patch_video_new.patch_0")
+    patch2b.video_sources[0xA002] = build_video(0xA002, filler(24, seed=203))  # new -> add branch
+
+    write_mod_case("mod_video_both_branches", bases=[base2], patches=[patch2a, patch2b])
+
+    # --- Case 3: `Mod.add_game_archive`'s ActorMixer-only cross-*archive*
+    # children merge (`core.py:1907-1912`) — distinct from `GameArchive.load`'s
+    # wider five-type cross-*bank* union already covered by phase 4's
+    # `audio_container_children_merge_*` fixtures. Two base archives each
+    # own a *different* bank, but both banks define the *same* ActorMixer
+    # `hierarchy_id` with non-overlapping children; loading base_2 after
+    # base_1 must union them into the pooled `hierarchy_entries` copy *and*
+    # backfill base_2's own bank copy (not base_1's — a real, verified
+    # upstream asymmetry, see `Mod::add_game_archive`'s doc comment). Only
+    # base_2's bank ever gets marked modified (by the patch's Sound
+    # propBundle merge below), so only its serialized bytes are checkable
+    # here — but that's sufficient to prove the merged children made it into
+    # what actually gets written.
+    # Both leaves must be defined in *both* banks' own hierarchy (kept
+    # byte-identical), even though each bank's ActorMixer only lists one as
+    # a child — otherwise `WwiseHierarchy.get_data`'s dangling-child pruning
+    # (a *different*, per-bank mechanism — see `containers.rs`'s module doc)
+    # would silently drop whichever leaf isn't locally defined, masking the
+    # cross-archive union this case exists to prove. Same pattern phase 4's
+    # `audio_container_children_merge_*` fixtures use for the cross-*bank*
+    # union.
+    mixer_id = 0xC001
+    leaf_a = opaque_entry(0x01, 0xC010, filler(4, seed=1))
+    leaf_b = opaque_entry(0x01, 0xC020, filler(4, seed=2))
+
+    base3a = base_archive("3333333333333333")
+    base3a.wwise_banks[0xB001] = build_bank(
+        0xB001, [leaf_a, leaf_b, build_actor_mixer(154, mixer_id, children_ids=[0xC010])], version=154
+    )
+
+    merge_source_id = 0xC040
+    merge_original_bytes = filler(40, seed=204)
+    merge_bp = build_base_param(154)
+    set_prop_bundle(154, merge_bp, [2], [b"bbbb"])
+    merge_sound = build_sound(154, 0xC030, build_bank_source(154, merge_source_id, len(merge_original_bytes)), merge_bp)
+
+    base3b = base_archive("4444444444444444")
+    bank_b = build_bank(
+        0xB002, [leaf_a, leaf_b, build_actor_mixer(154, mixer_id, children_ids=[0xC020]), merge_sound], version=154
+    )
+    bank_b.media_index = [merge_source_id]
+    base3b.wwise_banks[0xB002] = bank_b
+    base3b.audio_sources[merge_source_id] = build_bank_audio_source(merge_source_id, merge_original_bytes)
+
+    patch3_bp = build_base_param(154)
+    set_prop_bundle(154, patch3_bp, [3], [b"cccc"])
+    patch3_sound = build_sound(154, 0xC030, build_bank_source(154, merge_source_id, len(merge_original_bytes)), patch3_bp)
+    patch3 = base_archive("mod_patch_actormixer.patch_0")
+    patch_bank_b = build_bank(0xB002, [patch3_sound], version=154)
+    patch_bank_b.media_index = [merge_source_id]
+    patch3.wwise_banks[0xB002] = patch_bank_b
+
+    write_mod_case("mod_add_game_archive_actormixer_merge", bases=[base3a, base3b], patches=[patch3])
+
+    print("Done.")
+
+
 if __name__ == "__main__":
     build_cases()
     build_phase3_roundtrip_cases()
     build_phase3_merge_cases()
     build_phase4_cases()
+    build_phase5_cases()

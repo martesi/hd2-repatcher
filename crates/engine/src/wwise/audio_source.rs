@@ -12,9 +12,13 @@ pub const STREAM_TYPE_PREFETCH: u32 = 1;
 pub const STREAM_TYPE_STREAM: u32 = 2;
 
 /// Port of `AudioSource`. The Python `parents` back-reference set and `muted`
-/// flag are dropped: `parents` only exists for GUI modified-propagation and a
-/// dead/commented-out `MusicTrack` duration-sync branch (see the plan doc);
-/// `muted` is a GUI-only mute toggle this headless engine never sets.
+/// flag are dropped: `muted` is a GUI-only mute toggle this headless engine
+/// never sets. `parents` is used for two things in real upstream — a
+/// dead/commented-out `MusicTrack` duration-sync branch (genuinely dead), and
+/// `AudioSource.set_data`'s `notify_subscribers` path, which marks a bank
+/// modified when one of its Sound/MusicTrack sources gets new audio bytes
+/// (very much alive). `Mod::import_patch` restores that second effect via a
+/// live scan instead of a maintained back-reference — see its doc comment.
 #[derive(Debug, Default, Clone)]
 pub struct AudioSource {
     pub data: Vec<u8>,

@@ -265,8 +265,19 @@ impl WwiseHierarchy {
     /// hierarchies), and our unified `HircEntry` enum doesn't carry a
     /// separate "which Python module" tag the way upstream's two mirrored
     /// class hierarchies do.
-    pub fn import_hierarchy(&mut self, new_hierarchy: &WwiseHierarchy) {
+    ///
+    /// Returns whether anything actually changed (an entry's bytes differed
+    /// after merge, or — v140 only — a brand new entry got added). Real
+    /// upstream discovers this per-entry, inside `HircEntry.set_data`, via a
+    /// `soundbanks` back-reference this port's `HircEntry` doesn't carry
+    /// (see the plan doc's "no parent/back-reference fields" decision); the
+    /// caller ([`crate::wwise::archive::WwiseBank::import_hierarchy`]) uses
+    /// this instead to decide whether to raise the owning bank's `modified`
+    /// flag, which is what `write_patch`/`write_separate_patches` actually
+    /// filter on — a real but easy-to-miss requirement, not cosmetic.
+    pub fn import_hierarchy(&mut self, new_hierarchy: &WwiseHierarchy) -> bool {
         let version = self.version;
+        let mut changed = false;
         for entry in new_hierarchy.entries.values() {
             let mergeable = match version {
                 BankVersion::V140 => matches!(entry, HircEntry::MusicSegment(_) | HircEntry::MusicTrack(_)),
@@ -283,11 +294,17 @@ impl WwiseHierarchy {
             }
             let id = entry.id();
             if let Some(existing) = self.entries.get_mut(&id) {
+                let before = existing.get_data();
                 existing.import_entry(entry, version);
+                if existing.get_data() != before {
+                    changed = true;
+                }
             } else if version == BankVersion::V140 {
                 self.entries.insert(id, entry.clone());
+                changed = true;
             }
         }
+        changed
     }
 
     /// `WwiseHierarchy.get_data`: item count prefix + each entry's bytes, in

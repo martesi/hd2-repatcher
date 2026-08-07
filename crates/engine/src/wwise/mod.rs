@@ -14,10 +14,12 @@ pub mod archive;
 pub mod audio_source;
 pub mod bank_parser;
 pub mod hierarchy;
+pub mod mod_;
 pub mod text_bank;
 pub mod video;
 
 pub use archive::GameArchive;
+pub use mod_::Mod;
 
 /// Wwise plugin id for Vorbis-encoded sources.
 pub const VORBIS: u32 = 0x0004_0001;

@@ -1,10 +1,12 @@
 """Trimmed, phase-scoped port of hd2-audio-modder/core.py for the golden-fixture
-oracle. Dropped entirely: `SoundHandler` (playback), `Mod` (added in the phase
-that ports `Mod::import_patch`/`write_patch`), and everything GUI/Wwise-project
-related. Kept: `GameArchive` and everything it touches (`AudioSource`,
-`WwiseStream`, `WwiseBank`, `WwiseDep`, `TextBank`, `StringEntry`,
-`VideoSource`, `BankParser`, `MediaIndex`, `TocHeader`) — this is the read/write
-skeleton phase 1 of the native port targets.
+oracle. Dropped entirely: `SoundHandler` (playback) and everything GUI/
+Wwise-project related. Kept: `GameArchive` and everything it touches
+(`AudioSource`, `WwiseStream`, `WwiseBank`, `WwiseDep`, `TextBank`,
+`StringEntry`, `VideoSource`, `BankParser`, `MediaIndex`, `TocHeader`) — the
+read/write skeleton phase 1 of the native port targets — plus `Mod`
+(`import_patch`/`write_patch`/`write_separate_patches`/`add_game_archive`/
+`load_archive_file`), trimmed per `.ref/native-audio-patch-plan.md`'s phase 5
+scope (see `Mod`'s own docstring below for exactly what's dropped).
 """
 
 import os
@@ -234,7 +236,18 @@ class WwiseBank:
         self.file_id: int = 0
 
     def import_hierarchy(self, new_hierarchy):
+        """Trimmed: real upstream propagates `raise_modified()` per merged
+        entry via a `soundbanks` back-reference this oracle's `HircEntry`
+        trim drops (see wwise_hierarchy_154.py's module docstring).
+        Behaviorally equivalent substitute used here (and mirrored by the
+        Rust port): compare the hierarchy's serialized bytes before/after
+        the merge and raise_modified() on any change — same net effect
+        (this bank appears in write_patch's modified-filtered output
+        whenever the merge actually changed something)."""
+        before = self.hierarchy.get_data()
         self.hierarchy.import_hierarchy(new_hierarchy)
+        if self.hierarchy.get_data() != before:
+            self.raise_modified()
 
     def add_content(self, content: int):
         self.content.append(content)
@@ -860,3 +873,296 @@ class GameArchive:
             return None
         audio.short_id = source.source_id
         return audio
+
+
+class Mod:
+    """Trimmed port of `core.py::Mod`. Dropped: `db` constructor argument
+    (GUI undo/redo persistence only), per-resource `*_count` dicts (only
+    needed by `remove_game_archive`, out of scope — see the plan doc),
+    `import_wems`/`import_wavs`/`import_files`, `dump_*`, `create_dummy_bank`,
+    hierarchy CRUD beyond `import_wwise_hierarchy`, `revert_*`. Kept: exactly
+    what `import_patch`/`write_patch`/`write_separate_patches`/
+    `add_game_archive`/`load_archive_file` need.
+
+    `add_game_archive`'s `parents`-set reconciliation (real upstream
+    reparents `AudioSource.parents`/`HircEntry.soundbanks` across the old vs.
+    new owning bank) is dropped along with `parents`/`soundbanks` themselves
+    (see `AudioSource`'s and `HircEntry`'s trims) — this GUI undo/redo-only
+    bookkeeping is genuinely dead here. `parents` is NOT otherwise dead,
+    though: real upstream also uses it, via `AudioSource.set_data`'s
+    `notify_subscribers` path, to mark a bank modified when one of its
+    Sound/MusicTrack sources gets new audio bytes — `import_patch` restores
+    that specific effect below via a live scan instead (see the
+    `swapped_ids` comment).
+    """
+
+    def __init__(self, name: str = ""):
+        self.wwise_streams = {}
+        self.wwise_banks = {}
+        self.audio_sources = {}
+        self.text_banks = {}
+        self.video_sources = {}
+        self.hierarchy_entries = {}
+        self.game_archives = {}
+        self.name = name
+
+    def get_audio_source(self, audio_id: int):
+        try:
+            return self.audio_sources[audio_id]
+        except KeyError:
+            pass
+        for source in self.audio_sources.values():
+            if source.resource_id == audio_id:
+                return source
+        raise KeyError(f"Cannot find audio source with id {audio_id}")
+
+    def get_wwise_bank(self, soundbank_id: int):
+        try:
+            return self.wwise_banks[soundbank_id]
+        except KeyError:
+            raise KeyError(f"Cannot find soundbank with id {soundbank_id}")
+
+    def get_wwise_streams(self):
+        return self.wwise_streams
+
+    def get_wwise_banks(self):
+        return self.wwise_banks
+
+    def get_audio_sources(self):
+        return self.audio_sources
+
+    def get_text_banks(self):
+        return self.text_banks
+
+    def get_video_sources(self):
+        return self.video_sources
+
+    def get_video_source(self, file_id: int):
+        try:
+            return self.video_sources[file_id]
+        except KeyError:
+            raise KeyError(f"Cannot find video with id {file_id}")
+
+    def get_hierarchy_entries(self):
+        return self.hierarchy_entries
+
+    def get_hierarchy_entry(self, hierarchy_id: int):
+        return self.hierarchy_entries[hierarchy_id]
+
+    def get_game_archives(self):
+        return self.game_archives
+
+    def load_archive_file(self, archive_file: str = ""):
+        if os.path.splitext(archive_file)[1] in (".stream", ".gpu_resources"):
+            archive_file = os.path.splitext(archive_file)[0]
+        new_archive = GameArchive.from_file(archive_file)
+        if not new_archive:
+            return False
+        key = new_archive.name
+        if key in self.game_archives:
+            return False
+        self.add_game_archive(new_archive)
+        return True
+
+    def import_wwise_hierarchy(self, soundbank_id: int, new_hierarchy):
+        self.get_wwise_bank(soundbank_id).import_hierarchy(new_hierarchy)
+
+    def import_video(self, video_path: str, video_id: int):
+        self.get_video_sources()[video_id].set_data(video_path)
+        self.get_video_source(video_id).replacement_video_offset = 0
+
+    def add_game_archive(self, game_archive: "GameArchive"):
+        """`core.py::Mod.add_game_archive`, trimmed of `parents`/count-dict
+        bookkeeping (see class docstring). Still faithful to real upstream
+        for what matters here: video/hierarchy-entry/bank/stream/text-bank/
+        audio-source de-dup against the already-pooled state, including the
+        real, narrower-than-`GameArchive.load`'s-cross-bank-union
+        ActorMixer-only children merge (`core.py:1907-1912`)."""
+        key = game_archive.name
+        if key in self.game_archives:
+            return
+        self.game_archives[key] = game_archive
+
+        for vid_key, entry in game_archive.video_sources.items():
+            if vid_key in self.video_sources:
+                game_archive.video_sources[vid_key] = self.video_sources[vid_key]
+            else:
+                self.video_sources[vid_key] = entry
+
+        replacements = {}
+        for hid, entry in game_archive.get_hierarchy_entries().items():
+            if hid in self.hierarchy_entries:
+                existing_entry = self.hierarchy_entries[hid]
+                replacements[hid] = existing_entry
+                if isinstance(entry, (wwise_hierarchy_154.ActorMixer, wwise_hierarchy_140.ActorMixer)):
+                    for child in entry.children.children:
+                        if child not in existing_entry.children.children:
+                            existing_entry.children.children.append(child)
+                            existing_entry.size += 4
+            else:
+                self.hierarchy_entries[hid] = entry
+        for bank in game_archive.wwise_banks.values():
+            for hid, replacement in replacements.items():
+                if hid in bank.hierarchy.entries:
+                    bank.hierarchy.entries[hid] = replacement
+        game_archive.get_hierarchy_entries().update(replacements)
+
+        for bkey in list(game_archive.wwise_banks.keys()):
+            if bkey in self.wwise_banks:
+                game_archive.wwise_banks[bkey] = self.wwise_banks[bkey]
+            else:
+                self.wwise_banks[bkey] = game_archive.wwise_banks[bkey]
+        for skey in list(game_archive.wwise_streams.keys()):
+            if skey in self.wwise_streams:
+                game_archive.wwise_streams[skey] = self.wwise_streams[skey]
+            else:
+                self.wwise_streams[skey] = game_archive.wwise_streams[skey]
+        for tkey in list(game_archive.text_banks.keys()):
+            if tkey in self.text_banks:
+                game_archive.text_banks[tkey] = self.text_banks[tkey]
+            else:
+                self.text_banks[tkey] = game_archive.text_banks[tkey]
+        for akey in list(game_archive.audio_sources.keys()):
+            if akey in self.audio_sources:
+                game_archive.audio_sources[akey] = self.audio_sources[akey]
+            else:
+                self.audio_sources[akey] = game_archive.audio_sources[akey]
+
+    def import_patch(self, patch_file: str = "", import_hierarchy: bool = True) -> bool:
+        if os.path.splitext(patch_file)[1] in (".stream", ".gpu_resources"):
+            patch_file = os.path.splitext(patch_file)[0]
+        if not os.path.exists(patch_file) or not os.path.isfile(patch_file):
+            raise OSError("Invalid file!")
+
+        patch_game_archive = GameArchive.from_file(patch_file)
+        if patch_game_archive is None:
+            return False
+
+        swapped_ids = set()
+        for new_audio in patch_game_archive.get_audio_sources().values():
+            try:
+                old_audio = self.get_audio_source(new_audio.get_short_id())
+            except KeyError:
+                continue
+            if (
+                not old_audio.modified
+                and new_audio.get_data() != old_audio.get_data()
+                or old_audio.modified
+                and new_audio.get_data() != old_audio.data_old
+            ):
+                old_audio.set_data(new_audio.get_data())
+                swapped_ids.add(new_audio.get_short_id())
+
+        if swapped_ids:
+            # Trimmed: real upstream discovers which banks to mark modified
+            # via `AudioSource.parents`/`HircEntry.soundbanks` back-references
+            # (`AudioSource.set_data`'s `notify_subscribers` path,
+            # `core.py:76-90`) that this oracle's trim drops along with
+            # `parents`/`soundbanks`. Behaviorally equivalent substitute: a
+            # live scan for which banks' Sound/MusicTrack sources reference a
+            # swapped id, same as the hierarchy-merge case above.
+            for bank in self.get_wwise_banks().values():
+                entries = bank.hierarchy.get_sounds() + bank.hierarchy.get_music_tracks()
+                if any(src.source_id in swapped_ids for e in entries for src in e.sources):
+                    bank.raise_modified()
+
+        if import_hierarchy:
+            for bank in patch_game_archive.get_wwise_banks().values():
+                try:
+                    self.import_wwise_hierarchy(bank.get_id(), bank.hierarchy)
+                except Exception:
+                    pass
+
+        for text_bank in patch_game_archive.get_text_banks().values():
+            try:
+                self.get_text_banks()[text_bank.get_id()].import_text(text_bank)
+            except Exception:
+                pass
+
+        add_patch = False
+        for bank in list(patch_game_archive.get_wwise_banks().values()):
+            if bank.get_id() in self.get_wwise_banks():
+                del patch_game_archive.wwise_banks[bank.get_id()]
+        if len(patch_game_archive.get_wwise_banks()) > 0:
+            add_patch = True
+
+        for video in list(patch_game_archive.get_video_sources().values()):
+            has_video_source = False
+            try:
+                self.get_video_source(video.file_id)
+                has_video_source = True
+            except KeyError:
+                pass
+
+            if not has_video_source:
+                video.modified = True
+                video.replacement_video_offset = video.stream_offset
+                video.replacement_video_size = video.video_size
+                video.replacement_filepath = video.filepath + ".stream"
+                add_patch = True
+            else:
+                try:
+                    self.import_video(patch_file + ".stream", video.file_id)
+                    self.get_video_source(video.file_id).replacement_video_offset = video.stream_offset
+                except Exception:
+                    pass
+                del patch_game_archive.video_sources[video.file_id]
+
+        if add_patch:
+            patch_game_archive.text_banks.clear()
+            self.add_game_archive(patch_game_archive)
+
+        return True
+
+    def write_patch(self, output_folder: str = "", output_filename: str = ""):
+        patch_game_archive = GameArchive()
+        patch_game_archive.name = "9ba626afa44a3aa3.patch_0" if output_filename == "" else output_filename
+        patch_game_archive.magic = 0xF0000011
+        patch_game_archive.num_types = 0
+        patch_game_archive.num_files = 0
+        patch_game_archive.unknown = 0
+        patch_game_archive.unk4Data = bytes.fromhex(
+            "CE09F5F4000000000C729F9E8872B8BD00A06B02000000000079510000000000000000000000000000000000000000000000000000000000"
+        )
+        patch_game_archive.audio_sources = self.audio_sources
+
+        for key, value in self.get_wwise_streams().items():
+            if value.modified:
+                patch_game_archive.wwise_streams[key] = value
+        for key, value in self.get_wwise_banks().items():
+            if value.modified:
+                patch_game_archive.wwise_banks[key] = value
+        for key, value in self.get_text_banks().items():
+            if value.modified:
+                patch_game_archive.text_banks[key] = value
+        for key, value in self.get_video_sources().items():
+            if value.modified:
+                patch_game_archive.video_sources[key] = value
+
+        patch_game_archive.to_file(output_folder)
+
+    def write_separate_patches(self, output_folder: str = ""):
+        for archive in self.game_archives.values():
+            patch_game_archive = GameArchive()
+            patch_game_archive.name = f"{archive.name}.patch_0"
+            patch_game_archive.magic = 0xF0000011
+            patch_game_archive.num_types = 0
+            patch_game_archive.num_files = 0
+            patch_game_archive.unknown = archive.unknown
+            patch_game_archive.unk4Data = archive.unk4Data
+            patch_game_archive.audio_sources = archive.audio_sources
+
+            for key, value in archive.get_wwise_streams().items():
+                if value.modified:
+                    patch_game_archive.wwise_streams[key] = value
+            for key, value in archive.get_wwise_banks().items():
+                if value.modified:
+                    patch_game_archive.wwise_banks[key] = value
+            for key, value in archive.get_text_banks().items():
+                if value.modified:
+                    patch_game_archive.text_banks[key] = value
+            for key, value in archive.get_video_sources().items():
+                if value.modified:
+                    patch_game_archive.video_sources[key] = value
+
+            patch_game_archive.to_file(output_folder)

@@ -166,6 +166,18 @@ impl WwiseBank {
         }
     }
 
+    /// `WwiseBank.import_hierarchy`: merges a patch file's HIRC field
+    /// changes into this bank's own hierarchy, then raises this bank's
+    /// `modified` flag if the merge actually changed anything — see
+    /// [`WwiseHierarchy::import_hierarchy`]'s doc comment for why this
+    /// two-step (merge, then check-and-raise) shape replaces real
+    /// upstream's per-entry `soundbanks` back-reference callback.
+    pub fn import_hierarchy(&mut self, new_hierarchy: &WwiseHierarchy) {
+        if self.hierarchy.import_hierarchy(new_hierarchy) {
+            self.raise_modified();
+        }
+    }
+
     /// `WwiseBank.generate`: regenerates the bank blob from its hierarchy,
     /// including the DIDX/DATA re-embedding loop over `Sound`'s and
     /// `MusicTrack`'s audio sources.
