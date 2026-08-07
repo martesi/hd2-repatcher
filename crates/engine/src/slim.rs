@@ -250,6 +250,39 @@ impl Slim {
         }
     }
 
+    /// Returns the full decompressed `.stream` companion for a package (a
+    /// whole-file reconstruction, unlike [`Self::get_resource_from_package`]'s
+    /// single-resource read at a known offset). Package type is decided from the
+    /// main (no-suffix) file, matching the Python `load_package`'s single
+    /// dispatch reused for toc/gpu/stream. Unlike [`Self::get_package_toc`]'s
+    /// legacy branch, no legacy-TOC magic check is performed here — a `.stream`
+    /// payload is raw audio/media data, not a TOC, so it never carries that
+    /// magic.
+    pub fn get_stream_resource(&self, package_name: &str) -> Vec<u8> {
+        let name = basename_str(package_name);
+        let full_path = self.folder.join(&name);
+        let stream_name = format!("{name}.stream");
+        match self.package_type(&full_path) {
+            PackageType::Bundled => {
+                let Some(package) = self.package_contents.get(&stream_name) else {
+                    return Vec::new();
+                };
+                let Some(first) = package.entries.first() else {
+                    return Vec::new();
+                };
+                let bundle = self
+                    .folder
+                    .join(format!("bundles.{:02}.nxa", first.bundle_index));
+                self.get_resource_from_bundle(&bundle, first.start_offset as u64)
+            }
+            PackageType::Dsar => {
+                let stream_path = self.folder.join(&stream_name);
+                self.get_resource_from_bundle(&stream_path, 0)
+            }
+            PackageType::Legacy => std::fs::read(self.folder.join(&stream_name)).unwrap_or_default(),
+        }
+    }
+
     /// Decodes `bundles.nxa` into the package index and per-bundle chunk-offset
     /// maps.
     fn init_bundle_mapping(&mut self) {

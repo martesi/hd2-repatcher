@@ -10,6 +10,7 @@ mod memstream;
 mod patch;
 mod resources;
 mod slim;
+pub mod wwise;
 
 pub mod settings;
 

@@ -69,9 +69,52 @@ impl MemoryStream {
         slice
     }
 
+    pub fn read_u8(&mut self) -> u8 {
+        self.read(1)[0]
+    }
+
+    pub fn read_i8(&mut self) -> i8 {
+        self.read(1)[0] as i8
+    }
+
+    pub fn read_u16(&mut self) -> u16 {
+        let b = self.read(2);
+        u16::from_le_bytes([b[0], b[1]])
+    }
+
+    pub fn read_i16(&mut self) -> i16 {
+        let b = self.read(2);
+        i16::from_le_bytes([b[0], b[1]])
+    }
+
     pub fn read_u32(&mut self) -> u32 {
         let b = self.read(4);
         u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    }
+
+    pub fn read_i32(&mut self) -> i32 {
+        let b = self.read(4);
+        i32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    }
+
+    pub fn read_u64(&mut self) -> u64 {
+        let b = self.read(8);
+        u64::from_le_bytes(b.try_into().unwrap())
+    }
+
+    pub fn read_i64(&mut self) -> i64 {
+        let b = self.read(8);
+        i64::from_le_bytes(b.try_into().unwrap())
+    }
+
+    pub fn read_f32(&mut self) -> f32 {
+        let b = self.read(4);
+        f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    }
+
+    pub fn read_f64(&mut self) -> f64 {
+        let b = self.read(8);
+        f64::from_le_bytes(b.try_into().unwrap())
     }
 
     /// Overwrites at the current location, extending as needed, and advances.

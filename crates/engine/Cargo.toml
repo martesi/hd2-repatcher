@@ -11,3 +11,4 @@ serde_json = { workspace = true }
 rayon = { workspace = true }
 lz4_flex = { workspace = true }
 dirs = { workspace = true }
+indexmap = { workspace = true }

@@ -105,7 +105,9 @@ fn golden_fixtures_match_python_oracle() {
         .expect("fixtures dir exists; run `python tools/gen_golden.py`")
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.is_dir())
+        // `audio_*` fixtures share this directory but belong to
+        // `audio_golden.rs` (see `tools/gen_audio_golden.py`).
+        .filter(|p| p.is_dir() && !p.file_name().unwrap().to_string_lossy().starts_with("audio_"))
         .collect();
     cases.sort();
     assert!(!cases.is_empty(), "no fixtures found");
