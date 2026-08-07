@@ -40,6 +40,39 @@
           wrapGAppsHook3
         ];
 
+        devPackages = [
+          rustToolchain
+          pkgs.cargo-tauri
+          pkgs.bun
+          pkgs.nodejs_24
+          pkgs.python3 # dev-only: regenerating golden fixtures via reference engine
+        ] ++ buildTools ++ tauriLibs;
+
+        # Tauri's webkitgtk needs these at runtime; the compositing workaround
+        # avoids the known blank-window issue on NixOS/Wayland.
+        #
+        # __EGL_VENDOR_LIBRARY_DIRS is what makes headless (Xvfb) runs work.
+        # webkitgtk resolves libEGL through its own RPATH, but libglvnd looks
+        # for vendor ICD json in /usr/share/glvnd/egl_vendor.d, which does not
+        # exist on NixOS. With no ICD, the webview aborts on startup with
+        # "Could not create default EGL display: EGL_BAD_PARAMETER" and paints
+        # a blank white window - it looks like an app bug, not a missing
+        # library, so it costs a while to track down. Pointing glvnd at mesa
+        # gets a software (llvmpipe) context. The :- guard leaves a real
+        # desktop alone: NixOS already exports this to /run/opengl-driver/...,
+        # and clobbering it would drop hardware accel for e.g. nvidia users.
+        #
+        # Shared by `default` and `e2e` rather than copy-pasted: the two must
+        # not drift, and a headless run missing the EGL line fails in a way
+        # that looks nothing like a missing environment variable.
+        tauriHook = ''
+          export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath tauriLibs}:$LD_LIBRARY_PATH"
+          export __EGL_VENDOR_LIBRARY_DIRS="''${__EGL_VENDOR_LIBRARY_DIRS:-${pkgs.mesa}/share/glvnd/egl_vendor.d}"
+          export XDG_DATA_DIRS="${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}:${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:$XDG_DATA_DIRS"
+          export GIO_MODULE_DIR="${pkgs.glib-networking}/lib/gio/modules/"
+          export WEBKIT_DISABLE_COMPOSITING_MODE=1
+        '';
+
         winCrossToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" ];
           targets = [ "x86_64-pc-windows-gnu" ];
@@ -48,21 +81,31 @@
       in
       {
         devShells.default = pkgs.mkShell {
-          packages = [
-            rustToolchain
-            pkgs.cargo-tauri
-            pkgs.bun
-            pkgs.nodejs_24
-            pkgs.python3 # dev-only: regenerating golden fixtures via reference engine
-          ] ++ buildTools ++ tauriLibs;
+          packages = devPackages;
+          shellHook = tauriHook;
+        };
 
-          # Tauri's webkitgtk needs these at runtime; the compositing workaround
-          # avoids the known blank-window issue on NixOS/Wayland.
-          shellHook = ''
-            export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath tauriLibs}:$LD_LIBRARY_PATH"
-            export XDG_DATA_DIRS="${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}:${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:$XDG_DATA_DIRS"
-            export GIO_MODULE_DIR="${pkgs.glib-networking}/lib/gio/modules/"
-            export WEBKIT_DISABLE_COMPOSITING_MODE=1
+        # Driving the GUI headlessly (Xvfb + screenshots + synthetic input).
+        # Deliberately a sibling shell rather than extra packages on `default`:
+        # this closure is dead weight for everyday development, and only
+        # end-to-end runs should pay for it. Declaring it here rather than
+        # relying on preinstalled tools keeps the capability reproducible for
+        # anyone who clones the repo.
+        devShells.e2e = pkgs.mkShell {
+          packages = devPackages ++ [
+            pkgs.xvfb # the X server itself
+            pkgs.xdpyinfo # readiness check - Xvfb takes a moment to accept clients
+            pkgs.xdotool # synthetic mouse/keyboard input
+            pkgs.imagemagick # `import -window root shot.png`
+          ];
+
+          # DISPLAY is preset so an app launched after Xvfb comes up needs no
+          # per-command wrapping. Until you start a server it points at a
+          # display that doesn't exist, which fails exactly like an unset
+          # DISPLAY - so start Xvfb and wait for it first. The :- guard keeps
+          # a real desktop's display, or one you picked yourself.
+          shellHook = tauriHook + ''
+            export DISPLAY="''${DISPLAY:-:99}"
           '';
         };
 
