@@ -35,7 +35,6 @@ struct BundleEntry {
 }
 
 struct Package {
-    #[allow(dead_code)]
     size: u64,
     entries: Vec<BundleEntry>,
 }
@@ -171,6 +170,74 @@ impl Slim {
         }
     }
 
+    /// Concatenates consecutive chunk-chains from a bundle file, starting at
+    /// `start_offset`, until `size` uncompressed bytes have been collected.
+    /// Port of `slim.py::get_resources_from_bundle` (plural — distinct from
+    /// [`Self::get_resource_from_bundle`], which returns a single chunk-chain
+    /// and is what this repeatedly calls). Needed because a package's data
+    /// can span more bytes than one `START`-to-`START` chunk-chain covers.
+    fn get_resources_from_bundle(&self, bundle_path: &Path, start_offset: u32, size: u32) -> Vec<u8> {
+        let mut current_size = 0u32;
+        let mut out = Vec::new();
+        while current_size < size {
+            let resource = self.get_resource_from_bundle(bundle_path, (start_offset + current_size) as u64);
+            if resource.is_empty() {
+                break;
+            }
+            current_size += resource.len() as u32;
+            out.extend_from_slice(&resource);
+        }
+        out
+    }
+
+    /// Reconstructs a whole bundled package's contents (not just its first
+    /// entry — see [`Self::get_package_toc`]'s narrower single-entry read for
+    /// the cheap-header-scan case) by stitching every one of its
+    /// [`BundleEntry`]s into a `package.size`-length buffer at each entry's
+    /// own `original_archive_offset`, each entry spanning up to the next
+    /// entry's offset (or the package's end, for the last one). Port of
+    /// `slim.py::reconstruct_package_from_bundles`. `name` must already be a
+    /// basename (a `package_contents` key), matching every caller here.
+    fn reconstruct_package_from_bundles(&self, name: &str) -> Vec<u8> {
+        let Some(package) = self.package_contents.get(name) else {
+            return Vec::new();
+        };
+        let mut package_data = vec![0u8; package.size as usize];
+        for (i, item) in package.entries.iter().enumerate() {
+            let item_size = match package.entries.get(i + 1) {
+                Some(next) => next.original_archive_offset - item.original_archive_offset,
+                None => package.size - item.original_archive_offset,
+            };
+            let bundle = self.folder.join(format!("bundles.{:02}.nxa", item.bundle_index));
+            let combined = self.get_resources_from_bundle(&bundle, item.start_offset, item_size as u32);
+            let start = item.original_archive_offset as usize;
+            if start >= package_data.len() {
+                continue;
+            }
+            let end = (start + combined.len()).min(package_data.len());
+            package_data[start..end].copy_from_slice(&combined[..end - start]);
+        }
+        package_data
+    }
+
+    /// Returns the *full* reconstructed TOC blob for a package — unlike
+    /// [`Self::get_package_toc`]'s header-only slice (cheap, used for
+    /// id-indexing scans), this includes every embedded resource's actual
+    /// bytes too, since a `TocHeader::toc_data_offset` for e.g. a
+    /// `WWISE_BANK` entry points deep into this same buffer, well past the
+    /// header table. Port of `slim.py::load_package`'s `toc_data` return
+    /// value (its `gpu_data` isn't ported — no resource type this engine
+    /// handles lives in `.gpu_resources`).
+    pub fn load_package_toc(&self, package_name: &str) -> Vec<u8> {
+        let name = basename_str(package_name);
+        let full_path = self.folder.join(&name);
+        match self.package_type(&full_path) {
+            PackageType::Bundled => self.reconstruct_package_from_bundles(&name),
+            PackageType::Dsar => self.decompress_dsar(&full_path),
+            PackageType::Legacy => std::fs::read(&full_path).unwrap_or_default(),
+        }
+    }
+
     /// Reads a resource (of `resource_size` for legacy packages) at
     /// `resource_file_offset` within a package, dispatching by package type.
     pub fn get_resource_from_package(
@@ -257,28 +324,18 @@ impl Slim {
     /// dispatch reused for toc/gpu/stream. Unlike [`Self::get_package_toc`]'s
     /// legacy branch, no legacy-TOC magic check is performed here — a `.stream`
     /// payload is raw audio/media data, not a TOC, so it never carries that
-    /// magic.
+    /// magic. Bundled/DSAR branches reconstruct the *whole* `.stream` package
+    /// ([`Self::reconstruct_package_from_bundles`] / whole-file
+    /// [`Self::decompress_dsar`]) rather than just its first entry/chunk-chain
+    /// — a `.stream` companion can span multiple bundle entries same as a main
+    /// TOC file can, matching `load_package`'s own dispatch for `.stream`.
     pub fn get_stream_resource(&self, package_name: &str) -> Vec<u8> {
         let name = basename_str(package_name);
         let full_path = self.folder.join(&name);
         let stream_name = format!("{name}.stream");
         match self.package_type(&full_path) {
-            PackageType::Bundled => {
-                let Some(package) = self.package_contents.get(&stream_name) else {
-                    return Vec::new();
-                };
-                let Some(first) = package.entries.first() else {
-                    return Vec::new();
-                };
-                let bundle = self
-                    .folder
-                    .join(format!("bundles.{:02}.nxa", first.bundle_index));
-                self.get_resource_from_bundle(&bundle, first.start_offset as u64)
-            }
-            PackageType::Dsar => {
-                let stream_path = self.folder.join(&stream_name);
-                self.get_resource_from_bundle(&stream_path, 0)
-            }
+            PackageType::Bundled => self.reconstruct_package_from_bundles(&stream_name),
+            PackageType::Dsar => self.decompress_dsar(&self.folder.join(&stream_name)),
             PackageType::Legacy => std::fs::read(self.folder.join(&stream_name)).unwrap_or_default(),
         }
     }
@@ -382,6 +439,147 @@ fn basename(path: &Path) -> String {
 
 fn basename_str(name: &str) -> String {
     basename(Path::new(name))
+}
+
+/// Tests for the whole-package/whole-file reconstruction paths
+/// ([`Slim::load_package_toc`], [`Slim::get_stream_resource`]'s DSAR/Bundled
+/// branches, [`Slim::reconstruct_package_from_bundles`]) added when phase 6
+/// wired `Slim` into real base-archive loading. These specifically pin the
+/// "read everything, not just the first chunk-chain/entry" behavior those
+/// paths need but [`Slim::get_package_toc`]'s deliberately-narrower
+/// first-entry-only header scan does not — constructed by hand since no
+/// integration test builds real DSAR/bundle files elsewhere in this crate.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a DSAR-format blob: a 0x20-byte main header (`num_chunks` @
+    /// offset 8), one 0x20-byte chunk header per chunk (`uncompressed_offset`
+    /// cumulative @0, `compressed_offset` (absolute file position of its
+    /// payload) @8, `uncompressed_size`/`compressed_size` @16/@20 — equal
+    /// here since every chunk is stored uncompressed for simplicity —
+    /// `compression_type` @24, `chunk_type` @25), then the chunk payloads
+    /// back-to-back. Mirrors the layout `decompress_dsar`/
+    /// `get_resource_from_bundle` both read.
+    fn build_dsar(chunks: &[&[u8]], starts: &[bool]) -> Vec<u8> {
+        let num_chunks = chunks.len();
+        let mut payload_offset = (0x20 + 0x20 * num_chunks) as u64;
+        let mut uncompressed_cum = 0u64;
+        let mut headers = Vec::new();
+        let mut payloads = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let mut h = vec![0u8; 0x20];
+            h[0..8].copy_from_slice(&uncompressed_cum.to_le_bytes());
+            h[8..16].copy_from_slice(&payload_offset.to_le_bytes());
+            h[16..20].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+            h[20..24].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+            h[24] = UNCOMPRESSED;
+            h[25] = if starts[i] { START } else { 0 };
+            headers.extend_from_slice(&h);
+            payloads.extend_from_slice(chunk);
+            uncompressed_cum += chunk.len() as u64;
+            payload_offset += chunk.len() as u64;
+        }
+        let mut out = vec![0u8; 0x20];
+        out[8..12].copy_from_slice(&(num_chunks as u32).to_le_bytes());
+        out.extend_from_slice(&headers);
+        out.extend_from_slice(&payloads);
+        out
+    }
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("hd2-slim-test-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn empty_slim(folder: PathBuf) -> Slim {
+        Slim {
+            folder,
+            is_slim: true,
+            package_contents: HashMap::new(),
+            bundle_offsets: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn decompress_dsar_reads_every_chunk_not_just_the_first_chain() {
+        // Two separate START chunk-chains — `get_resource_from_bundle` would
+        // stop after the first; whole-file decompression must return both.
+        let a = b"first-resource-AAAA".as_slice();
+        let b = b"second-resource-BBBB".as_slice();
+        let dir = tmp_dir("dsar-whole");
+        let path = dir.join("thing");
+        std::fs::write(&path, build_dsar(&[a, b], &[true, true])).unwrap();
+
+        let got = empty_slim(dir.clone()).decompress_dsar(&path);
+        assert_eq!(got, [a, b].concat());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_stream_resource_dsar_branch_reads_the_whole_stream_file() {
+        let a = b"stream-part-one!!".as_slice();
+        let b = b"stream-part-two!!".as_slice();
+        let dir = tmp_dir("dsar-stream");
+        // `package_type()` classifies by the *main* (no-suffix) file's magic;
+        // give it the DSAR magic so `get_stream_resource` takes the Dsar
+        // branch for the ".stream" companion.
+        std::fs::write(dir.join("pkg"), DSAR_MAGIC.to_le_bytes()).unwrap();
+        std::fs::write(dir.join("pkg.stream"), build_dsar(&[a, b], &[true, true])).unwrap();
+
+        let got = empty_slim(dir.clone()).get_stream_resource("pkg");
+        assert_eq!(got, [a, b].concat());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconstruct_package_from_bundles_stitches_every_entry_not_just_the_first() {
+        // A package split across two entries in the same bundle file, each
+        // its own START chunk-chain — the pre-phase-6 code only ever read
+        // `entries[0]`, silently truncating any package needing a second
+        // entry.
+        let a = b"entryA-bytes".as_slice();
+        let b = b"entryB-longer-bytes".as_slice();
+        let dir = tmp_dir("bundled");
+        std::fs::write(dir.join("bundles.00.nxa"), build_dsar(&[a, b], &[true, true])).unwrap();
+
+        let mut package_contents = HashMap::new();
+        package_contents.insert(
+            "pkg".to_string(),
+            Package {
+                size: (a.len() + b.len()) as u64,
+                entries: vec![
+                    BundleEntry {
+                        original_archive_offset: 0,
+                        start_offset: 0,
+                        bundle_index: 0,
+                    },
+                    BundleEntry {
+                        original_archive_offset: a.len() as u64,
+                        start_offset: a.len() as u32,
+                        bundle_index: 0,
+                    },
+                ],
+            },
+        );
+        let mut bundle_offsets = HashMap::new();
+        bundle_offsets.insert("bundles.00.nxa".to_string(), HashMap::from([(0u64, 0usize), (a.len() as u64, 1usize)]));
+
+        let slim = Slim {
+            folder: dir.clone(),
+            is_slim: true,
+            package_contents,
+            bundle_offsets,
+        };
+        let got = slim.load_package_toc("pkg");
+        assert_eq!(got, [a, b].concat());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 fn cstring_at(buf: &[u8], start: usize) -> String {

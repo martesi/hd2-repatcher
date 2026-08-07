@@ -23,6 +23,7 @@ use std::path::Path;
 
 use indexmap::IndexMap;
 
+use crate::slim::Slim;
 use crate::wwise::archive::{GameArchive, WwiseBank};
 use crate::wwise::audio_source::{AudioSource, WwiseStream};
 use crate::wwise::hierarchy::{ActorMixer, HircEntry};
@@ -67,12 +68,13 @@ impl Mod {
         self.audio_sources.values_mut().find(|s| s.resource_id == audio_id)
     }
 
-    /// `Mod.load_archive_file`: loads a mod `.patch_N` file (or a genuine
-    /// base archive already in the plain/uncompressed on-disk shape — real
-    /// base-archive loading via `Slim` decompression is phase 6) and adopts
-    /// it via [`Self::add_game_archive`]. Returns `false` if the file
-    /// couldn't be read/parsed or an archive of the same name is already
-    /// loaded (matching Python's early-return semantics).
+    /// `Mod.load_archive_file`: loads a mod `.patch_N` file (or any other
+    /// archive already in the plain/uncompressed on-disk shape) and adopts it
+    /// via [`Self::add_game_archive`]. Returns `false` if the file couldn't
+    /// be read/parsed or an archive of the same name is already loaded
+    /// (matching Python's early-return semantics). For a genuine *base* game
+    /// archive, which may be DSAR/bundle-compressed, use
+    /// [`Self::load_base_archive`] instead.
     pub fn load_archive_file(&mut self, path: &Path) -> bool {
         let path = if matches!(path.extension().and_then(|e| e.to_str()), Some("stream" | "gpu_resources")) {
             path.with_extension("")
@@ -85,6 +87,30 @@ impl Mod {
         if self.game_archives.contains_key(&new_archive.name) {
             return false;
         }
+        self.add_game_archive(new_archive);
+        true
+    }
+
+    /// [`Self::load_archive_file`]'s counterpart for a genuine *base* game
+    /// archive: loads it by display name through `Slim` (transparently
+    /// decompressing DSAR/bundled packages, or reading a legacy install's
+    /// plain file — see [`Slim::load_package_toc`]/[`Slim::get_stream_resource`]),
+    /// then adopts it via [`Self::add_game_archive`]. Mirrors real upstream's
+    /// `GameArchive.from_file` when it's pointed at the base install (via
+    /// `load_package`) rather than a plain-file mod patch; `archive_name` is
+    /// resolved by the caller through `AudioIndex`, which replaces the
+    /// external friendlynames db real upstream's headless CLI consults for
+    /// the same lookup. Returns `false` under the same conditions as
+    /// [`Self::load_archive_file`].
+    pub fn load_base_archive(&mut self, slim: &Slim, archive_name: &str) -> bool {
+        if self.game_archives.contains_key(archive_name) {
+            return false;
+        }
+        let toc_data = slim.load_package_toc(archive_name);
+        let stream_data = slim.get_stream_resource(archive_name);
+        let Some(new_archive) = GameArchive::from_toc_and_stream(archive_name.to_string(), &toc_data, &stream_data) else {
+            return false;
+        };
         self.add_game_archive(new_archive);
         true
     }

@@ -6,6 +6,7 @@
 //! can be diffed, and a differential golden-fixture test suite
 //! (`tests/golden.rs`) pins the byte-exact output against the Python oracle.
 
+mod audio_resources;
 mod memstream;
 mod patch;
 mod resources;
@@ -14,8 +15,10 @@ pub mod wwise;
 
 pub mod settings;
 
+pub use audio_resources::AudioIndex;
 pub use patch::{update_patch_file, PatchOutcome, UnitData, UnitDataSource};
 pub use resources::GameResources;
+pub use slim::Slim;
 
 use rayon::prelude::*;
 use serde::Serialize;

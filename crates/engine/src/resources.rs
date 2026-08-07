@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
+use crate::audio_resources::AudioIndex;
 use crate::patch::{UnitData, UnitDataSource};
 use crate::slim::Slim;
-use crate::UNIT_TYPE_ID;
+use crate::{UNIT_TYPE_ID, WWISE_BANK};
 
 /// Where a unit resource lives inside the game data. Mirrors the Python tuple
 /// `(basename, toc_data_offset, toc_data_size)`.
@@ -28,23 +29,41 @@ pub struct GameResources {
     folder: PathBuf,
     slim: Slim,
     mapping: HashMap<u64, ResourceLoc>,
+    audio: AudioIndex,
 }
 
 impl GameResources {
-    /// Points at a game data folder and indexes its unit resources. Mirrors
-    /// `init_game_resources`.
+    /// Points at a game data folder and indexes its unit *and* soundbank
+    /// resources in a single pass (one `Slim` init, one directory walk).
+    /// Mirrors `init_game_resources`, generalized per
+    /// `.ref/native-audio-patch-plan.md`'s "Archive index" section to also
+    /// build the [`AudioIndex`] that replaces the external friendlynames db.
     pub fn load(path: &Path) -> Self {
         let slim = Slim::init(path);
-        let mapping = load_game_resources(path, &slim);
+        let (mapping, audio_mapping) = load_game_resources(path, &slim);
         GameResources {
             folder: path.to_path_buf(),
             slim,
             mapping,
+            audio: AudioIndex::from_mapping(audio_mapping),
         }
     }
 
     pub fn unit_count(&self) -> usize {
         self.mapping.len()
+    }
+
+    /// Soundbank id -> containing base archive lookup, for native audio-patch
+    /// loading (`wwise::Mod::load_base_archive`).
+    pub fn audio_index(&self) -> &AudioIndex {
+        &self.audio
+    }
+
+    /// The `Slim` package accessor this game data was indexed through, for
+    /// native audio-patch loading (`wwise::Mod::load_base_archive`, which
+    /// needs to decompress base archives the same way this index was built).
+    pub fn slim(&self) -> &Slim {
+        &self.slim
     }
 }
 
@@ -135,16 +154,31 @@ fn read_unit_data_legacy(path: &Path, data_offset: u64) -> UnitData {
     }
 }
 
-/// Parses a package's TOC and records every unit resource it contains.
-fn load_resources_from_file(display_name: &str, slim: &Slim) -> Vec<(u64, ResourceLoc)> {
-    let toc = slim.get_package_toc(display_name);
-    if toc.len() < 72 {
-        return Vec::new();
-    }
+/// One row from a package's (header-only) TOC file-header table. Shared
+/// return shape for [`scan_package_toc`] — see its doc comment.
+pub(crate) struct TocRow {
+    pub type_id: u64,
+    pub file_id: u64,
+    pub toc_data_offset: u64,
+    pub toc_data_size: u32,
+}
+
+/// Parses a package's header-only TOC ([`Slim::get_package_toc`]) and returns
+/// its basename display name alongside every file-header row whose
+/// `type_id` is in `want`. Shared by [`load_resources_from_file`] (filters
+/// for `UNIT_TYPE_ID`) and [`crate::audio_resources::AudioIndex`]'s build
+/// step (filters for `WWISE_BANK`) — same 72-byte header + 80-byte-stride
+/// file-header walk, generalized over which type ids the caller cares about
+/// per `.ref/native-audio-patch-plan.md`'s "Archive index" section.
+pub(crate) fn scan_package_toc(display_name: &str, slim: &Slim, want: &[u64]) -> (String, Vec<TocRow>) {
     let name = Path::new(display_name)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| display_name.to_string());
+    let toc = slim.get_package_toc(display_name);
+    if toc.len() < 72 {
+        return (name, Vec::new());
+    }
     let num_types = u32_at(&toc, 4).unwrap_or(0) as usize;
     let num_files = u32_at(&toc, 8).unwrap_or(0) as usize;
     let toc_start = 72 + 32 * num_types;
@@ -159,22 +193,44 @@ fn load_resources_from_file(display_name: &str, slim: &Slim) -> Vec<(u64, Resour
         ) else {
             break;
         };
-        if type_id == UNIT_TYPE_ID {
-            out.push((
+        if want.contains(&type_id) {
+            out.push(TocRow {
+                type_id,
                 file_id,
-                ResourceLoc {
-                    name: name.clone(),
-                    toc_data_offset,
-                    toc_data_size,
-                },
-            ));
+                toc_data_offset,
+                toc_data_size,
+            });
         }
     }
-    out
+    (name, out)
 }
 
-/// Builds the full unit-id -> location map for the whole game data folder.
-fn load_game_resources(folder: &Path, slim: &Slim) -> HashMap<u64, ResourceLoc> {
+/// Parses a package's TOC and records every unit resource and every
+/// soundbank it contains.
+fn load_resources_from_file(display_name: &str, slim: &Slim) -> (Vec<(u64, ResourceLoc)>, Vec<(u64, String)>) {
+    let (name, rows) = scan_package_toc(display_name, slim, &[UNIT_TYPE_ID, WWISE_BANK]);
+    let mut units = Vec::new();
+    let mut banks = Vec::new();
+    for row in rows {
+        if row.type_id == UNIT_TYPE_ID {
+            units.push((
+                row.file_id,
+                ResourceLoc {
+                    name: name.clone(),
+                    toc_data_offset: row.toc_data_offset,
+                    toc_data_size: row.toc_data_size,
+                },
+            ));
+        } else if row.type_id == WWISE_BANK {
+            banks.push((row.file_id, name.clone()));
+        }
+    }
+    (units, banks)
+}
+
+/// Builds the full unit-id -> location map and soundbank-id -> archive-name
+/// map for the whole game data folder, in one pass.
+fn load_game_resources(folder: &Path, slim: &Slim) -> (HashMap<u64, ResourceLoc>, HashMap<u64, String>) {
     let names: Vec<String> = if slim.is_slim {
         slim_package_names(folder)
     } else {
@@ -188,18 +244,22 @@ fn load_game_resources(folder: &Path, slim: &Slim) -> HashMap<u64, ResourceLoc> 
 
     // Index packages in parallel, then fold in order so duplicate ids resolve
     // deterministically (last package wins, matching a serial dict build).
-    let per_file: Vec<Vec<(u64, ResourceLoc)>> = names
+    let per_file: Vec<(Vec<(u64, ResourceLoc)>, Vec<(u64, String)>)> = names
         .par_iter()
         .map(|name| load_resources_from_file(name, slim))
         .collect();
 
     let mut mapping = HashMap::new();
-    for entries in per_file {
-        for (id, loc) in entries {
+    let mut audio_mapping = HashMap::new();
+    for (units, banks) in per_file {
+        for (id, loc) in units {
             mapping.insert(id, loc);
         }
+        for (id, name) in banks {
+            audio_mapping.insert(id, name);
+        }
     }
-    mapping
+    (mapping, audio_mapping)
 }
 
 /// Package names for a slim install, read from `bundle_database.data`.
