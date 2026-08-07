@@ -1066,6 +1066,16 @@ class Mod:
                 if any(src.source_id in swapped_ids for e in entries for src in e.sources):
                     bank.raise_modified()
 
+            # Same gap, for streams: `old_audio.set_data` above already
+            # mutated `self.wwise_streams[resource_id].audio_source` too
+            # (same aliased object, per `_create_audio_source_type_stream`),
+            # but real upstream's `notify_subscribers` path is what would
+            # have raised the owning `WwiseStream.modified` flag, and this
+            # oracle's trim drops that along with `parents`.
+            for stream in self.get_wwise_streams().values():
+                if stream.audio_source is not None and stream.audio_source.get_short_id() in swapped_ids:
+                    stream.raise_modified()
+
         if import_hierarchy:
             for bank in patch_game_archive.get_wwise_banks().values():
                 try:

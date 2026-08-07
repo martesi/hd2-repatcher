@@ -25,7 +25,7 @@ use indexmap::IndexMap;
 
 use crate::slim::Slim;
 use crate::wwise::archive::{GameArchive, WwiseBank};
-use crate::wwise::audio_source::{AudioSource, WwiseStream};
+use crate::wwise::audio_source::{AudioSource, WwiseStream, STREAM_TYPE_BANK};
 use crate::wwise::hierarchy::{ActorMixer, HircEntry};
 use crate::wwise::text_bank::TextBank;
 use crate::wwise::video::VideoSource;
@@ -225,8 +225,29 @@ impl Mod {
                 new_data != old_audio.data_old
             };
             if changed {
-                old_audio.set_data(new_data, true);
+                old_audio.set_data(new_data.clone(), true);
+                let resource_id = old_audio.resource_id;
+                let stream_type = old_audio.stream_type;
                 swapped_ids.insert(new_audio.short_id);
+
+                // Real upstream's `self.audio_sources[short_id]` and
+                // `self.wwise_streams[resource_id].audio_source` are the
+                // *same* Python object for a stream-backed source
+                // (`_create_audio_source_type_stream` returns the
+                // `WwiseStream`'s own `AudioSource`, not a copy), so
+                // `old_audio.set_data` above already mutates both there.
+                // `archive.rs::resolve_audio_sources` clones instead (see
+                // its doc comment), so this port needs an explicit
+                // write-through here, plus the `modified` flag real
+                // upstream's dropped `notify_subscribers` path would have
+                // raised on the owning `WwiseStream` — same substitute this
+                // module already applies to banks, just for streams.
+                if stream_type != STREAM_TYPE_BANK {
+                    if let Some(stream) = self.wwise_streams.get_mut(&resource_id) {
+                        stream.audio_source.set_data(new_data, true);
+                        stream.modified = true;
+                    }
+                }
             }
         }
 

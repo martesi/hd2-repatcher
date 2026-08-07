@@ -16,6 +16,7 @@ Run from the repo root:  python tools/gen_audio_golden.py
 """
 
 import json
+import os
 import sys
 import tempfile
 import types
@@ -38,6 +39,7 @@ import audio_const as ac_const  # noqa: E402
 import wwise_hierarchy_140 as h140  # noqa: E402
 import wwise_hierarchy_154 as h154  # noqa: E402
 from wwise_hierarchy_140 import HircEntry, WwiseHierarchy_140  # noqa: E402
+from audio_util import murmur64_hash  # noqa: E402
 
 
 def hirc_module(version: int):
@@ -1028,6 +1030,49 @@ def build_phase5_cases():
     patch3.wwise_banks[0xB002] = patch_bank_b
 
     write_mod_case("mod_add_game_archive_actormixer_merge", bases=[base3a, base3b], patches=[patch3])
+
+    # --- Case 4: streamed (non-bank-embedded) audio-byte swap through
+    # `Mod.import_patch` — the analogous case to Case 1's bank-embedded
+    # swap, but for a `Sound` source whose `stream_type` is `STREAM`, so its
+    # bytes live in a `WwiseStream`/`.stream` companion instead of the
+    # bank's own DIDX/DATA. Exercises the `swapped_ids` -> owning-
+    # `WwiseStream`-must-be-marked-modified gap this fixture found missing
+    # (mirrors Case 1's bank-modified gap, but for streams instead of
+    # banks) — real upstream's `self.audio_sources[short_id]` and
+    # `self.wwise_streams[resource_id].audio_source` alias the same object,
+    # so the byte swap alone doesn't prove anything unless the resulting
+    # `.stream` companion also survives `write_patch`/`write_separate_patches`,
+    # which only happens once the owning `WwiseStream.modified` flag is set.
+    stream_source_id = 0xE001
+    stream_original_bytes = filler(64, seed=301)
+    stream_new_bytes = filler(48, seed=302)
+    stream_dep_data = "audio/streamed/example.bnk"
+    stream_file_id = murmur64_hash(f"{os.path.dirname(stream_dep_data)}/{stream_source_id}".encode("utf-8"))
+
+    def build_stream_sound(version, hierarchy_id, source_id, data):
+        src = build_bank_source(version, source_id, len(data))
+        src.stream_type = ac_const.STREAM
+        return build_sound(version, hierarchy_id, src, build_base_param(version))
+
+    base4 = base_archive("5555555555555555")
+    base4.wwise_streams[stream_file_id] = build_stream(stream_file_id, stream_original_bytes)
+    bank4 = build_bank(0x9101, [build_stream_sound(154, 0xF101, stream_source_id, stream_original_bytes)], version=154)
+    bank4.dep.skip = False
+    bank4.dep.tag = 0x18
+    bank4.dep.data = stream_dep_data
+    bank4.dep.data_size = len(stream_dep_data.encode("utf-8"))
+    base4.wwise_banks[0x9101] = bank4
+
+    patch4 = base_archive("mod_patch_stream_swap.patch_0")
+    patch4.wwise_streams[stream_file_id] = build_stream(stream_file_id, stream_new_bytes)
+    patch_bank4 = build_bank(0x9101, [build_stream_sound(154, 0xF101, stream_source_id, stream_new_bytes)], version=154)
+    patch_bank4.dep.skip = False
+    patch_bank4.dep.tag = 0x18
+    patch_bank4.dep.data = stream_dep_data
+    patch_bank4.dep.data_size = len(stream_dep_data.encode("utf-8"))
+    patch4.wwise_banks[0x9101] = patch_bank4
+
+    write_mod_case("mod_import_patch_stream_swap", bases=[base4], patches=[patch4])
 
     print("Done.")
 
