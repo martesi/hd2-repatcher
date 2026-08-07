@@ -167,8 +167,8 @@ impl WwiseBank {
     }
 
     /// `WwiseBank.generate`: regenerates the bank blob from its hierarchy,
-    /// including the DIDX/DATA re-embedding loop over `Sound`'s (and, once
-    /// phase 3 ports it, `MusicTrack`'s) audio sources.
+    /// including the DIDX/DATA re-embedding loop over `Sound`'s and
+    /// `MusicTrack`'s audio sources.
     pub fn generate(&self, audio_sources: &IndexMap<u64, AudioSource>) -> Vec<u8> {
         let mut data = self.bank_header.clone();
 
@@ -177,10 +177,11 @@ impl WwiseBank {
         let mut data_array: Vec<&[u8]> = Vec::new();
         let mut added_sources: HashSet<u32> = HashSet::new();
 
-        // `hierarchy.music_tracks()` is unconditionally empty until phase 3
-        // ports MusicTrack, matching Python's `get_sounds() + get_music_tracks()`.
-        for sound in self.hierarchy.sounds() {
-            for source in &sound.sources {
+        // Matches Python's `get_sounds() + get_music_tracks()`.
+        let sound_sources = self.hierarchy.sounds().into_iter().map(|s| &s.sources);
+        let track_sources = self.hierarchy.music_tracks().into_iter().map(|m| &m.sources);
+        for sources in sound_sources.chain(track_sources) {
+            for source in sources {
                 if source.plugin_id == VORBIS {
                     // Python: `if self.media_index and source_id not in
                     // self.media_index: continue` — an *empty* (but present)
@@ -453,9 +454,9 @@ impl GameArchive {
     }
 
     /// `_create_all_audio_source_objects` + `_create_audio_source*`:
-    /// resolves every `Sound` (and, once phase 3 ports it, `MusicTrack`)
-    /// source across every bank to its actual audio bytes and populates
-    /// `self.audio_sources`, keyed by `short_id` — not `AudioSource::id()`;
+    /// resolves every `Sound`'s and `MusicTrack`'s source across every bank
+    /// to its actual audio bytes and populates `self.audio_sources`, keyed
+    /// by `short_id` — not `AudioSource::id()`;
     /// Python always keys this particular map by `short_id`, even for
     /// STREAM-origin sources where `id()` would use `resource_id` instead.
     ///
@@ -481,9 +482,11 @@ impl GameArchive {
         let mut seen: HashSet<u32> = HashSet::new();
 
         for bank in self.wwise_banks.values() {
-            // MusicTrack sources join this loop once phase 3 ports MusicTrack.
-            for sound in bank.hierarchy.sounds() {
-                for source in &sound.sources {
+            // Matches Python's `get_sounds() + get_music_tracks()`.
+            let sound_sources = bank.hierarchy.sounds().into_iter().map(|s| &s.sources);
+            let track_sources = bank.hierarchy.music_tracks().into_iter().map(|m| &m.sources);
+            for sources in sound_sources.chain(track_sources) {
+                for source in sources {
                     if seen.contains(&source.source_id) {
                         continue;
                     }

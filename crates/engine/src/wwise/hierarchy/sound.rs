@@ -125,4 +125,22 @@ impl Sound {
         out.extend_from_slice(&data);
         out
     }
+
+    /// `Sound.set_data`'s merge, as driven by `WwiseHierarchy::import_hierarchy`.
+    /// v140 wholesale-replaces `sources`/`base_param`; v154 only replaces
+    /// `base_param.prop_bundle` (not the whole `base_param`, and not
+    /// `sources` at all — verified against real upstream, matching the same
+    /// "propBundle only" pattern `RandomSequenceContainer` uses for v154).
+    pub fn import_entry(&mut self, other: &Sound, version: BankVersion) {
+        match version {
+            BankVersion::V140 => {
+                self.sources = other.sources.clone();
+                self.base_param = other.base_param.clone();
+            }
+            BankVersion::V154 => {
+                self.base_param.prop_bundle = other.base_param.prop_bundle.clone();
+            }
+        }
+        self.size = self.pack().len() as u32;
+    }
 }

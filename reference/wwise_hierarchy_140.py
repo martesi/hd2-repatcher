@@ -3,16 +3,34 @@ Bank Version 140
 
 Trimmed, phase-scoped port of hd2-audio-modder/wwise_hierarchy_140.py. Ported
 so far: the opaque passthrough path (`HircEntry`), `Sound`/`BankSourceStruct`/
-`BaseParam` (and `BaseParam`'s sub-structures), and the `WwiseHierarchy_140`
-container. Trimmed of everything GUI/undo-redo/editing related (`set_data`,
-`update_size`, `import_entry`, `revert_modifications`, `add_entry`,
-`remove_entry`, parent back-references, the `PropBundle`/`RangedPropBundle`
-mutation helpers, ...) — none of that is reachable from `import_patch`/
-`write_patch`. Remaining structured HIRC types (`MusicTrack`, `MusicSegment`,
-the container types) are added in later phases as the Rust port grows to
-cover them; until then every other hierarchy entry round-trips as
-`(type, size, id, misc-bytes)`, matching how the real tool already treats
-every *unhandled* HIRC type.
+`BaseParam` (and `BaseParam`'s sub-structures), `MusicTrack`, `MusicSegment`,
+`RandomSequenceContainer` (+ `ContainerChildren`/`PlayListSetting`/
+`PlayListItem`), and the `WwiseHierarchy_140` container including
+`import_hierarchy`. Trimmed of GUI/undo-redo bookkeeping not reachable from
+`import_patch`/`write_patch` (`revert_modifications`, `add_entry`/
+`remove_entry`, `modified_children`, parent back-references, the
+`PropBundle`/`RangedPropBundle` mutation helpers, ...) — `set_data` IS kept
+(trimmed to just the field-copy loop + size recompute, dropping the
+`soundbanks`/`raise_modified` side effects), since `import_hierarchy` calls
+it and that path IS reachable from `import_patch` (a prior module docstring
+here claimed otherwise; that was wrong). Remaining structured HIRC types
+(the 4 container types besides `RandomSequenceContainer`) are added in a
+later phase as the Rust port grows to cover them; until then every other
+hierarchy entry round-trips as `(type, size, id, misc-bytes)`, matching how
+the real tool already treats every *unhandled* HIRC type.
+
+IMPORTANT gotcha (verified directly against the real upstream source, not
+just its internal comments): the upstream file named `wwise_hierarchy_140.py`
+carries an internal module docstring claiming "Bank Version 154" and
+`wwise_hierarchy_154.py` claims "Bank Version 140" — those in-file docstrings
+are simply wrong/swapped in the upstream source. The reliable signal is
+`core.py`'s `bank_version = ... ; if bank_version == 154: WwiseHierarchy_154
+else: WwiseHierarchy_140`, i.e. filename/class-name, not the docstring text.
+This file (and the Rust `BankVersion::V140`) matches upstream's
+`wwise_hierarchy_140.py` by that filename-based signal: no `cache_id` on
+`BankSourceStruct`/`TrackInfoStruct`, `MusicTrack` has no `BaseParam` (uses
+raw `override_bus_id`/`parent_id` fields instead), `MusicSegment` is the
+ad-hoc raw-skip shape (no `BaseParam`, a real serialized `parent_id`).
 """
 
 import copy
@@ -595,6 +613,8 @@ class BankSourceStruct:
 
 
 class Sound(HircEntry):
+    import_values = ["sources", "baseParam"]
+
     def __init__(self):
         super().__init__()
         self.sources: list[BankSourceStruct] = []
@@ -631,6 +651,365 @@ class Sound(HircEntry):
         header = struct.pack("<BI", self.hierarchy_type, self.size)
         return header + data
 
+    def set_data(self, entry=None):
+        """Trimmed `Sound.set_data`: field-copy + size recompute only, no
+        soundbanks/modified/parent bookkeeping (none of it affects output
+        bytes)."""
+        if entry:
+            for value in self.import_values:
+                try:
+                    setattr(self, value, getattr(entry, value))
+                except AttributeError:
+                    pass
+        self.size = len(self._pack())
+
+
+class TrackInfoStruct:
+    """v140: no `cache_id` (44 bytes total, `<IIIdddd`)."""
+
+    def __init__(self):
+        self.track_id = self.source_id = self.event_id = 0
+        self.play_at = self.begin_trim_offset = self.end_trim_offset = self.source_duration = 0.0
+
+    @classmethod
+    def from_bytes(cls, data):
+        t = TrackInfoStruct()
+        (
+            t.track_id,
+            t.source_id,
+            t.event_id,
+            t.play_at,
+            t.begin_trim_offset,
+            t.end_trim_offset,
+            t.source_duration,
+        ) = struct.unpack("<IIIdddd", data)
+        return t
+
+    def get_data(self):
+        return struct.pack(
+            "<IIIdddd",
+            self.track_id,
+            self.source_id,
+            self.event_id,
+            self.play_at,
+            self.begin_trim_offset,
+            self.end_trim_offset,
+            self.source_duration,
+        )
+
+
+class ClipAutomationStruct:
+    """Byte-identical between bank versions."""
+
+    def __init__(self):
+        self.clip_index = self.auto_type = 0
+        self.graph_points: list[tuple[float, float, int]] = []
+
+    @classmethod
+    def from_memory_stream(cls, stream: MemoryStream):
+        s = ClipAutomationStruct()
+        s.clip_index, s.auto_type, num_graph_points = struct.unpack("<III", stream.read(12))
+        s.graph_points = [struct.unpack("<ffI", stream.read(12)) for _ in range(num_graph_points)]
+        return s
+
+    def get_data(self):
+        return struct.pack("<III", self.clip_index, self.auto_type, len(self.graph_points)) + b"".join(
+            [struct.pack("<ffI", p[0], p[1], p[2]) for p in self.graph_points]
+        )
+
+
+class MusicTrack(HircEntry):
+    """v140: `bit_flags` right after `hierarchy_id`, no `BaseParam` — instead
+    raw `override_bus_id`/`parent_id` fields at the tail. `override_bus_id`
+    is read but NOT in `import_values` (matches upstream: it survives a
+    merge unchanged)."""
+
+    import_values = ["bit_flags", "unused_sections", "parent_id", "sources", "track_info", "clip_automations", "misc"]
+
+    def __init__(self):
+        super().__init__()
+        self.bit_flags = 0
+        self.unused_sections: list[bytes] = []
+        self.sources: list[BankSourceStruct] = []
+        self.track_info: list[TrackInfoStruct] = []
+        self.clip_automations: list[ClipAutomationStruct] = []
+        self.override_bus_id = 0
+        self.parent_id = 0
+
+    @classmethod
+    def from_memory_stream(cls, stream: MemoryStream):
+        entry = MusicTrack()
+        entry.hierarchy_type = stream.uint8_read()
+        entry.size = stream.uint32_read()
+        start_position = stream.tell()
+        entry.hierarchy_id = stream.uint32_read()
+        entry.bit_flags = stream.uint8_read()
+        num_sources = stream.uint32_read()
+        for _ in range(num_sources):
+            entry.sources.append(BankSourceStruct.from_memory_stream(stream))
+        num_track_info = stream.uint32_read()
+        for _ in range(num_track_info):
+            entry.track_info.append(TrackInfoStruct.from_bytes(stream.read(44)))
+        entry.unused_sections.append(stream.read(4))
+        num_clip_automations = stream.uint32_read()
+        for _ in range(num_clip_automations):
+            entry.clip_automations.append(ClipAutomationStruct.from_memory_stream(stream))
+        entry.unused_sections.append(stream.read(5))
+        entry.override_bus_id = stream.uint32_read()
+        entry.parent_id = stream.uint32_read()
+        entry.misc = stream.read(entry.size - (stream.tell() - start_position))
+        return entry
+
+    def get_data(self):
+        sources_bytes = b"".join([s.get_data() for s in self.sources])
+        track_bytes = b"".join([t.get_data() for t in self.track_info])
+        clip_bytes = b"".join([c.get_data() for c in self.clip_automations])
+        payload = (
+            sources_bytes
+            + len(self.track_info).to_bytes(4, byteorder="little")
+            + track_bytes
+            + self.unused_sections[0]
+            + len(self.clip_automations).to_bytes(4, byteorder="little")
+            + clip_bytes
+            + self.unused_sections[1]
+            + self.override_bus_id.to_bytes(4, byteorder="little")
+            + self.parent_id.to_bytes(4, byteorder="little")
+            + self.misc
+        )
+        self.size = 9 + len(payload)
+        return (
+            struct.pack("<BIIBI", self.hierarchy_type, self.size, self.hierarchy_id, self.bit_flags, len(self.sources))
+            + payload
+        )
+
+    def set_data(self, entry=None):
+        if entry:
+            for value in self.import_values:
+                try:
+                    setattr(self, value, getattr(entry, value))
+                except AttributeError:
+                    pass
+
+
+class MusicSegment(HircEntry):
+    """v140: ad-hoc raw-skip shape, no `BaseParam`. `parent_id` is a real,
+    directly-serialized field here (unlike v154 where it's derived from
+    `baseParam.directParentID` and not separately stored)."""
+
+    import_values = ["parent_id", "tracks", "duration", "unused_sections", "markers"]
+
+    def __init__(self):
+        super().__init__()
+        self.parent_id = 0
+        self.unused_sections: list[bytes] = []
+        self.tracks: list[int] = []
+        self.duration = 0.0
+        self.markers: list[list] = []  # [id, position, name-with-trailing-NUL]
+
+    @classmethod
+    def from_memory_stream(cls, stream: MemoryStream):
+        entry = MusicSegment()
+        entry.hierarchy_type = stream.uint8_read()
+        entry.size = stream.uint32_read()
+        entry.hierarchy_id = stream.uint32_read()
+        entry.unused_sections.append(stream.read(10))
+        entry.parent_id = stream.uint32_read()
+        entry.unused_sections.append(stream.read(1))
+        n = stream.uint8_read()  # number of props
+        stream.seek(stream.tell() - 1)
+        entry.unused_sections.append(stream.read(5 * n + 1))
+        n = stream.uint8_read()  # number of props (again)
+        stream.seek(stream.tell() - 1)
+        entry.unused_sections.append(stream.read(5 * n + 1 + 12 + 4))
+        n = stream.uint32_read()  # number of children (tracks)
+        for _ in range(n):
+            entry.tracks.append(stream.uint32_read())
+        entry.unused_sections.append(stream.read(23))  # meter info
+        n = stream.uint32_read()  # number of stingers
+        stream.seek(stream.tell() - 4)
+        entry.unused_sections.append(stream.read(24 * n + 4))
+        entry.duration = struct.unpack("<d", stream.read(8))[0]
+        n = stream.uint32_read()  # number of markers
+        for _ in range(n):
+            marker_id = stream.uint32_read()
+            position = struct.unpack("<d", stream.read(8))[0]
+            name = []
+            temp = b"1"
+            while temp != b"\x00":
+                temp = stream.read(1)
+                name.append(temp)
+            entry.markers.append([marker_id, position, b"".join(name)])
+        return entry
+
+    def get_data(self):
+        return b"".join(
+            [
+                struct.pack("<BII", self.hierarchy_type, self.size, self.hierarchy_id),
+                self.unused_sections[0],
+                self.parent_id.to_bytes(4, byteorder="little"),
+                self.unused_sections[1],
+                self.unused_sections[2],
+                self.unused_sections[3],
+                len(self.tracks).to_bytes(4, byteorder="little"),
+                b"".join([x.to_bytes(4, byteorder="little") for x in self.tracks]),
+                self.unused_sections[4],
+                self.unused_sections[5],
+                struct.pack("<d", self.duration),
+                len(self.markers).to_bytes(4, byteorder="little"),
+                b"".join(
+                    [b"".join([m[0].to_bytes(4, byteorder="little"), struct.pack("<d", m[1]), m[2]]) for m in self.markers]
+                ),
+            ]
+        )
+
+    def set_data(self, entry=None):
+        if entry:
+            for value in self.import_values:
+                try:
+                    setattr(self, value, getattr(entry, value))
+                except AttributeError:
+                    pass
+        self.size = len(self.get_data()) - 5
+
+
+class ContainerChildren:
+    def __init__(self):
+        self.children: list[int] = []
+
+    @classmethod
+    def from_memory_stream(cls, stream: MemoryStream):
+        c = ContainerChildren()
+        num_children = stream.uint32_read()
+        c.children = [stream.uint32_read() for _ in range(num_children)]
+        return c
+
+    def get_data(self):
+        b = struct.pack("<I", len(self.children))
+        for child in self.children:
+            b += struct.pack("<I", child)
+        return b
+
+
+class PlayListSetting:
+    def __init__(self):
+        self.sLoopCount = self.sLoopModMin = self.sLoopModMax = 0
+        self.fTransitionTime = self.fTransitionTimeModMin = self.fTransitionTimeModMax = 0.0
+        self.wAvoidReaptCount = 0
+        self.eTransitionMode = self.eRandomMode = self.eMode = self.byBitVectorPlayList = 0
+
+    @classmethod
+    def from_memory_stream(cls, stream: MemoryStream):
+        s = PlayListSetting()
+        s.sLoopCount = stream.uint16_read()
+        s.sLoopModMin = stream.uint16_read()
+        s.sLoopModMax = stream.uint16_read()
+        s.fTransitionTime = stream.float_read()
+        s.fTransitionTimeModMin = stream.float_read()
+        s.fTransitionTimeModMax = stream.float_read()
+        s.wAvoidReaptCount = stream.uint16_read()
+        s.eTransitionMode = stream.uint8_read()
+        s.eRandomMode = stream.uint8_read()
+        s.eMode = stream.uint8_read()
+        s.byBitVectorPlayList = stream.uint8_read()
+        return s
+
+    def get_data(self):
+        return struct.pack(
+            "<HHHfffHBBBB",
+            self.sLoopCount,
+            self.sLoopModMin,
+            self.sLoopModMax,
+            self.fTransitionTime,
+            self.fTransitionTimeModMin,
+            self.fTransitionTimeModMax,
+            self.wAvoidReaptCount,
+            self.eTransitionMode,
+            self.eRandomMode,
+            self.eMode,
+            self.byBitVectorPlayList,
+        )
+
+
+class PlayListItem:
+    def __init__(self, ulPlayID: int, weight: int):
+        self.ulPlayID = ulPlayID
+        self.weight = weight
+
+    def get_data(self):
+        return struct.pack("<Ii", self.ulPlayID, self.weight)
+
+
+class RandomSequenceContainer(HircEntry):
+    """Byte layout identical between bank versions; only the `import_hierarchy`
+    merge behaviour differs (v140 wholesale-replaces all 5 fields below; v154
+    only touches `baseParam.propBundle` + `playListSetting` — see
+    `wwise_hierarchy_154.py`)."""
+
+    import_values = ["baseParam", "children", "playListSetting", "ulPlayListItem", "playListItems"]
+
+    def __init__(self):
+        super().__init__()
+        self.baseParam: BaseParam | None = None
+        self.children = ContainerChildren()
+        self.playListSetting = PlayListSetting()
+        self.ulPlayListItem = 0
+        self.playListItems: list[PlayListItem] = []
+
+    @classmethod
+    def from_memory_stream(cls, stream: MemoryStream):
+        cntr = RandomSequenceContainer()
+        cntr.hierarchy_type = stream.uint8_read()
+        cntr.size = stream.uint32_read()
+        head = stream.tell()
+        cntr.hierarchy_id = stream.uint32_read()
+        cntr.baseParam = BaseParam.from_memory_stream(stream)
+        cntr.playListSetting = PlayListSetting.from_memory_stream(stream)
+        cntr.children = ContainerChildren.from_memory_stream(stream)
+        cntr.ulPlayListItem = stream.uint16_read()
+        cntr.playListItems = [
+            PlayListItem(stream.uint32_read(), stream.int32_read()) for _ in range(cntr.ulPlayListItem)
+        ]
+        tail = stream.tell()
+        assert_equal(
+            f"Header size and read data size mismatch for RandomSequenceContainer {cntr.hierarchy_id}",
+            cntr.size,
+            tail - head,
+        )
+        return cntr
+
+    def _pack(self):
+        data = struct.pack("<I", self.hierarchy_id)
+        data += self.baseParam.get_data()
+        data += self.playListSetting.get_data()
+        data += self.children.get_data()
+        assert_equal(
+            "# of playlist item mismatch # of item in the playlist item array",
+            self.ulPlayListItem,
+            len(self.playListItems),
+        )
+        data += struct.pack("<H", self.ulPlayListItem)
+        for item in self.playListItems:
+            data += item.get_data()
+        return data
+
+    def get_data(self):
+        data = self._pack()
+        assert_equal(
+            f"Header size and packed data size mismatch for RandomSequenceContainer {self.hierarchy_id}",
+            self.size,
+            len(data),
+        )
+        return struct.pack("<BI", self.hierarchy_type, self.size) + data
+
+    def set_data(self, entry=None):
+        if entry:
+            for value in self.import_values:
+                try:
+                    setattr(self, value, getattr(entry, value))
+                except AttributeError:
+                    pass
+        self.size = len(self._pack())
+
 
 class HircEntryFactory:
     @classmethod
@@ -639,6 +1018,12 @@ class HircEntryFactory:
         stream.seek(stream.tell() - 1)
         if hierarchy_type == 0x02:
             return Sound.from_memory_stream(stream)
+        if hierarchy_type == 0x05:
+            return RandomSequenceContainer.from_memory_stream(stream)
+        if hierarchy_type == 0x0A:
+            return MusicSegment.from_memory_stream(stream)
+        if hierarchy_type == 0x0B:
+            return MusicTrack.from_memory_stream(stream)
         return HircEntry.from_memory_stream(stream)
 
 
@@ -665,7 +1050,7 @@ class WwiseHierarchy_140:
         return [entry for entry in self.entries.values() if isinstance(entry, Sound)]
 
     def get_music_tracks(self):
-        return []
+        return [entry for entry in self.entries.values() if isinstance(entry, MusicTrack)]
 
     def has_entry(self, entry_id):
         return entry_id in self.entries
@@ -676,3 +1061,17 @@ class WwiseHierarchy_140:
     def get_data(self):
         arr = [entry.get_data() for entry in self.entries.values()]
         return len(arr).to_bytes(4, byteorder="little") + b"".join(arr)
+
+    def import_hierarchy(self, new_hierarchy):
+        """Trimmed `WwiseHierarchy_140.import_hierarchy`: v140 only merges
+        `MusicSegment`/`MusicTrack` entries (NOT `Sound`/
+        `RandomSequenceContainer` — verified against real upstream, a real
+        asymmetry vs. v154, not an oversight), and adds the incoming entry
+        wholesale if its id isn't already present (v154 does not have this
+        add-branch — see `wwise_hierarchy_154.py`)."""
+        for entry in new_hierarchy.get_entries():
+            if isinstance(entry, (MusicSegment, MusicTrack)):
+                if entry.hierarchy_id in self.entries:
+                    self.entries[entry.hierarchy_id].set_data(entry)
+                else:
+                    self.entries[entry.hierarchy_id] = entry

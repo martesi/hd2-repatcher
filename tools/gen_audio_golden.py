@@ -89,6 +89,128 @@ def build_sound(version: int, hierarchy_id: int, source, base_param):
     return s
 
 
+def set_prop_bundle(version: int, base_param, ids, values):
+    """Overwrites `base_param.propBundle` with a fresh one built from `ids`/
+    `values` (each value must be exactly 4 bytes) — used to build distinct
+    before/after `propBundle`s for the v154 "propBundle-only merge" fixtures."""
+    mod = hirc_module(version)
+    pb = mod.PropBundle()
+    pb.cProps = len(ids)
+    pb.pIDs = list(ids)
+    pb.pValues = [bytes(v) for v in values]
+    base_param.propBundle = pb
+    return base_param
+
+
+def build_track_info(version: int, *, track_id, source_id=0, event_id=0, play_at=0.0, begin=0.0, end=0.0, duration=0.0, cache_id=0):
+    mod = hirc_module(version)
+    t = mod.TrackInfoStruct()
+    t.track_id = track_id
+    t.source_id = source_id
+    t.event_id = event_id
+    t.play_at = play_at
+    t.begin_trim_offset = begin
+    t.end_trim_offset = end
+    t.source_duration = duration
+    if version == 154:
+        t.cache_id = cache_id
+    return t
+
+
+def build_clip_automation(version: int, clip_index: int, auto_type: int, points):
+    mod = hirc_module(version)
+    c = mod.ClipAutomationStruct()
+    c.clip_index = clip_index
+    c.auto_type = auto_type
+    c.graph_points = list(points)
+    return c
+
+
+def build_music_track(
+    version: int,
+    hierarchy_id: int,
+    *,
+    sources,
+    track_infos,
+    clip_automations,
+    bit_flags: int = 0,
+    override_bus_id: int = 0,
+    parent_id: int = 0,
+    track_type: int = 0,
+    num_fx: int = 0,
+):
+    mod = hirc_module(version)
+    t = mod.MusicTrack()
+    t.hierarchy_type = 0x0B
+    t.hierarchy_id = hierarchy_id
+    t.sources = list(sources)
+    t.track_info = list(track_infos)
+    t.clip_automations = list(clip_automations)
+    t.bit_flags = bit_flags
+    t.misc = b""
+    if version == 140:
+        t.unused_sections = [filler(4, seed=hierarchy_id), filler(5, seed=hierarchy_id + 1)]
+        t.override_bus_id = override_bus_id
+        t.parent_id = parent_id
+    else:
+        t.unk1 = filler(4, seed=hierarchy_id) if track_infos else b""
+        t.baseParam = build_base_param(154, num_fx=num_fx)
+        t.baseParam.directParentID = parent_id
+        t.track_type = track_type
+    return t
+
+
+def build_music_segment(version: int, hierarchy_id: int, *, tracks, duration, markers, bit_flags: int = 0, parent_id: int = 0):
+    """`markers`: list of `(id, position, name_bytes)`; `name_bytes` must NOT
+    contain an embedded NUL (the trailing NUL terminator is added here,
+    matching the read-until-NUL loop's stored representation)."""
+    mod = hirc_module(version)
+    seg = mod.MusicSegment()
+    seg.hierarchy_type = 0x0A
+    seg.hierarchy_id = hierarchy_id
+    seg.tracks = list(tracks)
+    seg.duration = duration
+    seg.markers = [[mid, pos, name + b"\x00"] for (mid, pos, name) in markers]
+    if version == 140:
+        seg.parent_id = parent_id
+        seg.unused_sections = [
+            filler(10, seed=hierarchy_id),  # [0]
+            filler(1, seed=hierarchy_id + 1),  # [1]
+            b"\x00",  # [2]: peek-u8 n=0 -> 5*0+1 = 1 byte
+            b"\x00" + filler(16, seed=hierarchy_id + 2),  # [3]: n=0 -> 5*0+1+12+4 = 17 bytes
+            filler(23, seed=hierarchy_id + 3),  # [4]: meter info
+            b"\x00\x00\x00\x00",  # [5]: peek-u32 stinger count=0 -> 24*0+4 = 4 bytes
+        ]
+    else:
+        seg.bit_flags = bit_flags
+        seg.baseParam = build_base_param(154)
+        seg.baseParam.directParentID = parent_id
+        seg.meter_info = filler(23, seed=hierarchy_id + 3)
+        seg.stingers = b"\x00\x00\x00\x00"  # peek-u32 stinger count=0 -> 4 bytes
+    # MusicSegment.get_data() doesn't assert on `size` (unlike Sound/
+    # RandomSequenceContainer) — its *length* doesn't depend on the value
+    # already in `size`, so this is safe as a single pass (mirrors
+    # `MusicSegment.set_data`'s own `self.size = len(self.get_data()) - 5`).
+    seg.size = len(seg.get_data()) - 5
+    return seg
+
+
+def build_random_sequence_container(version: int, hierarchy_id: int, *, children_ids, play_list_items, num_fx: int = 0, loop_count: int = 0):
+    mod = hirc_module(version)
+    cntr = mod.RandomSequenceContainer()
+    cntr.hierarchy_type = 0x05
+    cntr.hierarchy_id = hierarchy_id
+    cntr.baseParam = build_base_param(version, num_fx=num_fx)
+    cntr.playListSetting = mod.PlayListSetting()
+    cntr.playListSetting.sLoopCount = loop_count
+    cntr.playListSetting.eMode = 1
+    cntr.children.children = list(children_ids)
+    cntr.ulPlayListItem = len(play_list_items)
+    cntr.playListItems = [mod.PlayListItem(pid, w) for (pid, w) in play_list_items]
+    cntr.size = len(cntr._pack())
+    return cntr
+
+
 def build_bank_audio_source(short_id: int, data: bytes) -> "ac.AudioSource":
     audio = ac.AudioSource()
     audio.stream_type = ac_const.BANK
@@ -333,5 +455,212 @@ def build_cases():
     print("Done.")
 
 
+def build_phase3_roundtrip_cases():
+    """Phase 3: `MusicSegment`/`MusicTrack`/`RandomSequenceContainer` parsing
+    and `get_data()` re-serialization, exercised via the same full
+    `GameArchive` round trip as phase 1-2's fixtures — one archive per bank
+    version, mixing a `Sound` and a `MusicTrack` in the same bank so the
+    DIDX/DATA loop's `get_sounds() + get_music_tracks()` chain gets covered
+    too (two distinct BANK-embedded VORBIS sources)."""
+    print("Generating phase-3 round-trip fixtures...")
+
+    for version, case_name, base_id in ((140, "audio_music_types_v140", 0xA000_0000), (154, "audio_music_types_v154", 0xB000_0000)):
+        sound_source_id = base_id | 0x01
+        track_source_id = base_id | 0x02
+        sound_bytes = filler(72, seed=base_id + 1)
+        track_bytes = filler(56, seed=base_id + 2)
+
+        sound = build_sound(
+            version,
+            base_id | 0x1001,
+            build_bank_source(version, sound_source_id, len(sound_bytes)),
+            build_base_param(version),
+        )
+
+        track_info = build_track_info(
+            version, track_id=1, source_id=0x777, play_at=0.5, begin=0.1, end=0.9, duration=12.0, cache_id=3
+        )
+        clip = build_clip_automation(version, 0, 1, [(0.0, 1.0, 0), (1.0, 0.5, 2)])
+        track = build_music_track(
+            version,
+            base_id | 0x1002,
+            sources=[build_bank_source(version, track_source_id, len(track_bytes))],
+            track_infos=[track_info],
+            clip_automations=[clip],
+            bit_flags=7,
+            override_bus_id=555,
+            parent_id=999,
+            track_type=1,
+        )
+
+        segment = build_music_segment(
+            version,
+            base_id | 0x1003,
+            tracks=[base_id | 0x1002],
+            duration=42.5,
+            markers=[(1, 0.0, b"entry"), (2, 42.5, b"exit")],
+            bit_flags=2,
+            parent_id=0xDEAD,
+        )
+
+        rsc = build_random_sequence_container(
+            version,
+            base_id | 0x1004,
+            children_ids=[base_id | 0x1001, base_id | 0x1002],
+            play_list_items=[(base_id | 0x1001, 50), (base_id | 0x1002, 50)],
+            loop_count=3,
+        )
+
+        archive = base_archive("9ba626afa44a3aa3.patch_0")
+        bank = build_bank(base_id | 0x2000, [sound, track, segment, rsc], version=version)
+        bank.media_index = [sound_source_id, track_source_id]
+        archive.wwise_banks[base_id | 0x2000] = bank
+        archive.audio_sources[sound_source_id] = build_bank_audio_source(sound_source_id, sound_bytes)
+        archive.audio_sources[track_source_id] = build_bank_audio_source(track_source_id, track_bytes)
+        write_case(case_name, archive)
+
+
+def write_hierarchy_merge_case(name: str, version: int, base_entries, patch_entries):
+    """`import_hierarchy`'s field-merge, tested directly at the
+    `WwiseHierarchy` level (raw HIRC bytes in, raw HIRC bytes out) rather
+    than through a full `GameArchive`/`Mod`, since `Mod::import_patch`
+    orchestration is ported in a later phase. Writes `base.bin`/`patch.bin`
+    (each hierarchy's raw `get_data()`) and `expected.bin` (`base`'s
+    `get_data()` after `base.import_hierarchy(patch)`)."""
+    mod = hirc_module(version)
+    hier_cls = mod.WwiseHierarchy_154 if version == 154 else mod.WwiseHierarchy_140
+
+    base = hier_cls()
+    for e in base_entries:
+        base.entries[e.hierarchy_id] = e
+    patch = hier_cls()
+    for e in patch_entries:
+        patch.entries[e.hierarchy_id] = e
+
+    case_dir = FIXTURES / name
+    case_dir.mkdir(parents=True, exist_ok=True)
+    (case_dir / "base.bin").write_bytes(bytes(base.get_data()))
+    (case_dir / "patch.bin").write_bytes(bytes(patch.get_data()))
+
+    base.import_hierarchy(patch)
+    (case_dir / "expected.bin").write_bytes(bytes(base.get_data()))
+
+    (case_dir / "meta.json").write_text(json.dumps({"version": version}, indent=2))
+    print(f"  {name}: ok")
+
+
+def build_phase3_merge_cases():
+    """Phase 3: `import_hierarchy` field-merge for the 4 eligible types
+    (`Sound`, `MusicTrack`, `MusicSegment`, `RandomSequenceContainer`),
+    covering the real per-version asymmetry found by diffing upstream:
+    v140 only merges `MusicSegment`/`MusicTrack` (and adds a missing entry
+    wholesale); v154 merges all 4 (narrower per-type field lists, e.g.
+    `propBundle`-only for `Sound`/`RandomSequenceContainer`, matched-by-id
+    `track_info` merge for `MusicTrack`) but never adds a missing entry."""
+    print("Generating phase-3 import_hierarchy merge fixtures...")
+
+    # --- v140: only MusicSegment/MusicTrack merge; Sound/RandomSequenceContainer
+    # must come through untouched; a patch entry with an id absent from the
+    # base gets added wholesale.
+    v = 140
+    sound_base = build_sound(v, 0x1001, build_bank_source(v, 100, 64), build_base_param(v))
+    sound_patch = build_sound(v, 0x1001, build_bank_source(v, 999, 1), build_base_param(v, num_fx=1))
+
+    track_base = build_music_track(
+        v,
+        0x1002,
+        sources=[build_bank_source(v, 200, 32)],
+        track_infos=[build_track_info(v, track_id=1, source_id=555, duration=1.0)],
+        clip_automations=[build_clip_automation(v, 0, 0, [(0.0, 0.0, 0)])],
+        bit_flags=1,
+        override_bus_id=555,
+        parent_id=777,
+    )
+    track_patch = build_music_track(
+        v,
+        0x1002,
+        sources=[build_bank_source(v, 201, 40)],
+        track_infos=[build_track_info(v, track_id=2, source_id=556, duration=2.0)],
+        clip_automations=[build_clip_automation(v, 1, 1, [(1.0, 1.0, 1)])],
+        bit_flags=9,
+        override_bus_id=666,  # must NOT apply — v140 never merges override_bus_id
+        parent_id=888,
+    )
+
+    seg_base = build_music_segment(v, 0x1003, tracks=[1, 2], duration=1.5, markers=[(1, 0.0, b"a")], parent_id=42)
+    seg_patch = build_music_segment(v, 0x1003, tracks=[7, 8, 9], duration=9.75, markers=[(2, 1.0, b"b")], parent_id=100)
+
+    rsc_base = build_random_sequence_container(v, 0x1004, children_ids=[9, 10], play_list_items=[(1, 100), (2, 200)])
+    rsc_patch = build_random_sequence_container(v, 0x1004, children_ids=[11], play_list_items=[(3, 300)])
+
+    new_entry = build_music_segment(v, 0x1005, tracks=[42], duration=0.5, markers=[])
+
+    write_hierarchy_merge_case(
+        "hirc_merge_v140",
+        v,
+        base_entries=[sound_base, track_base, seg_base, rsc_base],
+        patch_entries=[sound_patch, track_patch, seg_patch, rsc_patch, new_entry],
+    )
+
+    # --- v154: all 4 types merge, but each with a narrower field list than a
+    # wholesale replace (see docstrings in `wwise_hierarchy_154.py`); no
+    # add-branch, so the id-0x2005 patch entry must be silently dropped.
+    v = 154
+    sound_base2 = build_sound(v, 0x2001, build_bank_source(v, 300, 64), build_base_param(v))
+    set_prop_bundle(v, sound_base2.baseParam, [1, 2], [b"aaaa", b"bbbb"])
+    sound_base2.size = len(sound_base2._pack())
+    sound_patch2 = build_sound(v, 0x2001, build_bank_source(v, 999, 1), build_base_param(v))
+    set_prop_bundle(v, sound_patch2.baseParam, [9], [b"zzzz"])
+    sound_patch2.size = len(sound_patch2._pack())
+
+    ti1_base = build_track_info(v, track_id=1, source_id=555, duration=10.0, cache_id=1)
+    ti2_base = build_track_info(v, track_id=2, event_id=777, play_at=1.0, duration=20.0, cache_id=2)
+    ti1_patch = build_track_info(v, track_id=91, source_id=555, play_at=99.0, begin=9.0, end=9.0, duration=99.0, cache_id=9)
+    ti2_patch = build_track_info(v, track_id=92, event_id=777, play_at=88.0, begin=8.0, end=8.0, duration=88.0, cache_id=8)
+    track_base2 = build_music_track(
+        v,
+        0x2002,
+        sources=[build_bank_source(v, 400, 32)],
+        track_infos=[ti1_base, ti2_base],
+        clip_automations=[build_clip_automation(v, 0, 0, [(0.0, 0.0, 0)])],
+        bit_flags=1,
+        parent_id=42,
+    )
+    track_patch2 = build_music_track(
+        v,
+        0x2002,
+        sources=[build_bank_source(v, 401, 40)],  # must NOT apply — v154 never merges sources
+        track_infos=[ti1_patch, ti2_patch],
+        clip_automations=[build_clip_automation(v, 1, 1, [(1.0, 1.0, 1)])],
+        bit_flags=9,  # must NOT apply
+        parent_id=100,
+    )
+
+    seg_base2 = build_music_segment(v, 0x2003, tracks=[1, 2], duration=1.5, markers=[(1, 0.0, b"a")], bit_flags=3, parent_id=42)
+    seg_patch2 = build_music_segment(
+        v, 0x2003, tracks=[7, 8, 9], duration=9.75, markers=[(2, 1.0, b"b")], bit_flags=9, parent_id=100
+    )  # bit_flags/base_param must NOT apply — only tracks/duration/markers do
+
+    rsc_base2 = build_random_sequence_container(v, 0x2004, children_ids=[9, 10], play_list_items=[(1, 100), (2, 200)], loop_count=1)
+    set_prop_bundle(v, rsc_base2.baseParam, [3], [b"cccc"])
+    rsc_base2.size = len(rsc_base2._pack())
+    rsc_patch2 = build_random_sequence_container(v, 0x2004, children_ids=[11], play_list_items=[(3, 300)], loop_count=9)
+    set_prop_bundle(v, rsc_patch2.baseParam, [4], [b"dddd"])
+    rsc_patch2.size = len(rsc_patch2._pack())
+
+    new_entry2 = build_music_segment(v, 0x2005, tracks=[42], duration=0.5, markers=[])
+
+    write_hierarchy_merge_case(
+        "hirc_merge_v154",
+        v,
+        base_entries=[sound_base2, track_base2, seg_base2, rsc_base2],
+        patch_entries=[sound_patch2, track_patch2, seg_patch2, rsc_patch2, new_entry2],
+    )
+
+    print("Done.")
+
+
 if __name__ == "__main__":
     build_cases()
+    build_phase3_roundtrip_cases()
+    build_phase3_merge_cases()
