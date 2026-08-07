@@ -394,8 +394,21 @@ impl GameArchive {
                 } else {
                     WwiseHierarchy::new(version)
                 };
+                // `GameArchive.load`'s cross-bank dedup (`core.py:818-829`):
+                // a `hierarchy_id` shared by more than one bank in this
+                // archive gets its children unioned into the first-seen
+                // copy rather than overwritten. Python then reassigns every
+                // sharing bank's own `hierarchy.entries[id]` to point at
+                // that same (mutated) object; this port instead backfills
+                // the final merged state into every bank's own entry map
+                // once the whole TOC has been scanned (below), since
+                // `HircEntry` is cloned rather than aliased here.
                 for (id, entry) in &hierarchy.entries {
-                    self.hierarchy_entries.insert(*id, entry.clone());
+                    if let Some(existing) = self.hierarchy_entries.get_mut(id) {
+                        existing.merge_children(entry);
+                    } else {
+                        self.hierarchy_entries.insert(*id, entry.clone());
+                    }
                 }
 
                 let media_index = if parser.chunks.contains_key("DIDX") {
@@ -447,6 +460,18 @@ impl GameArchive {
                 let end = start + header.stream_size as usize;
                 let video = VideoSource::from_original(header.file_id, header.stream_size, stream_data[start..end].to_vec());
                 self.video_sources.insert(video.id(), video);
+            }
+        }
+
+        // Backfill each bank's own hierarchy with the final cross-bank-merged
+        // entries (see the comment above), so that a bank whose copy of a
+        // shared `hierarchy_id` was the first-seen one still regenerates
+        // with the full unioned children set on `to_file`/`generate`.
+        for bank in self.wwise_banks.values_mut() {
+            for (id, entry) in bank.hierarchy.entries.iter_mut() {
+                if let Some(canonical) = self.hierarchy_entries.get(id) {
+                    *entry = canonical.clone();
+                }
             }
         }
 

@@ -4,20 +4,26 @@ Bank Version 140
 Trimmed, phase-scoped port of hd2-audio-modder/wwise_hierarchy_140.py. Ported
 so far: the opaque passthrough path (`HircEntry`), `Sound`/`BankSourceStruct`/
 `BaseParam` (and `BaseParam`'s sub-structures), `MusicTrack`, `MusicSegment`,
-`RandomSequenceContainer` (+ `ContainerChildren`/`PlayListSetting`/
-`PlayListItem`), and the `WwiseHierarchy_140` container including
-`import_hierarchy`. Trimmed of GUI/undo-redo bookkeeping not reachable from
-`import_patch`/`write_patch` (`revert_modifications`, `add_entry`/
-`remove_entry`, `modified_children`, parent back-references, the
-`PropBundle`/`RangedPropBundle` mutation helpers, ...) — `set_data` IS kept
-(trimmed to just the field-copy loop + size recompute, dropping the
+all five container types (`RandomSequenceContainer`, `ActorMixer`,
+`SwitchContainer`, `LayerContainer`, `MusicSwitchContainer`, plus their
+shared `ContainerChildren`/`PlayListSetting`/`PlayListItem`/`SwitchGroup`/
+`SwitchParam`), and the `WwiseHierarchy_140` container including
+`import_hierarchy` and `get_data`'s dangling-child pruning. Trimmed of
+GUI/undo-redo bookkeeping not reachable from `import_patch`/`write_patch`
+(`revert_modifications`, `add_entry`/`remove_entry`, `modified_children`,
+parent back-references, the `PropBundle`/`RangedPropBundle` mutation
+helpers, ...) — `set_data` IS kept on the types that need it (trimmed to
+just the field-copy loop + size recompute, dropping the
 `soundbanks`/`raise_modified` side effects), since `import_hierarchy` calls
 it and that path IS reachable from `import_patch` (a prior module docstring
-here claimed otherwise; that was wrong). Remaining structured HIRC types
-(the 4 container types besides `RandomSequenceContainer`) are added in a
-later phase as the Rust port grows to cover them; until then every other
-hierarchy entry round-trips as `(type, size, id, misc-bytes)`, matching how
-the real tool already treats every *unhandled* HIRC type.
+here claimed otherwise; that was wrong). `ActorMixer`/`SwitchContainer`/
+`LayerContainer`/`MusicSwitchContainer` don't get `set_data` at all — real
+upstream's `import_hierarchy` type filter excludes all four in both bank
+versions, confirmed directly against `core.py`, so only
+`from_memory_stream`/`get_data` (plus the raw `.children`/`.size` attributes
+`GameArchive.load`'s cross-bank merge mutates directly) are needed. Every
+other hierarchy entry still round-trips as `(type, size, id, misc-bytes)`,
+matching how the real tool already treats every *unhandled* HIRC type.
 
 IMPORTANT gotcha (verified directly against the real upstream source, not
 just its internal comments): the upstream file named `wwise_hierarchy_140.py`
@@ -1011,6 +1017,230 @@ class RandomSequenceContainer(HircEntry):
         self.size = len(self._pack())
 
 
+class LayerContainer(HircEntry):
+    """Byte layout identical between bank versions. Never merged via
+    `import_hierarchy`/`set_data` (real upstream's type filter excludes it in
+    both versions) — only `from_memory_stream`/`get_data` are needed, plus
+    the raw `.children` attribute `GameArchive.load`'s cross-bank merge reads
+    directly."""
+
+    def __init__(self):
+        super().__init__()
+        self.baseParam: BaseParam | None = None
+        self.children = ContainerChildren()
+        self.layerData = b""
+
+    @classmethod
+    def from_memory_stream(cls, stream: MemoryStream):
+        c = LayerContainer()
+        c.hierarchy_type = stream.uint8_read()
+        c.size = stream.uint32_read()
+        head = stream.tell()
+        c.hierarchy_id = stream.uint32_read()
+        c.baseParam = BaseParam.from_memory_stream(stream)
+        c.children = ContainerChildren.from_memory_stream(stream)
+        c.layerData = stream.read(c.size - (stream.tell() - head))
+        tail = stream.tell()
+        assert_equal(
+            f"Header size and read data size mismatch for LayerContainer {c.hierarchy_id}", c.size, tail - head
+        )
+        return c
+
+    def _pack(self):
+        data = struct.pack("<I", self.hierarchy_id)
+        data += self.baseParam.get_data()
+        data += self.children.get_data()
+        data += self.layerData
+        return data
+
+    def get_data(self):
+        data = self._pack()
+        assert_equal(
+            f"Header size and packed data size mismatch for LayerContainer {self.hierarchy_id}", self.size, len(data)
+        )
+        return struct.pack("<BI", self.hierarchy_type, self.size) + data
+
+
+class ActorMixer(HircEntry):
+    """Byte layout identical between bank versions. Same trimming rationale
+    as `LayerContainer`."""
+
+    def __init__(self):
+        super().__init__()
+        self.baseParam: BaseParam | None = None
+        self.children = ContainerChildren()
+
+    @classmethod
+    def from_memory_stream(cls, stream: MemoryStream):
+        m = ActorMixer()
+        m.hierarchy_type = stream.uint8_read()
+        m.size = stream.uint32_read()
+        head = stream.tell()
+        m.hierarchy_id = stream.uint32_read()
+        m.baseParam = BaseParam.from_memory_stream(stream)
+        m.children = ContainerChildren.from_memory_stream(stream)
+        tail = stream.tell()
+        assert_equal(f"Header size and read data size mismatch for ActorMixer {m.hierarchy_id}", m.size, tail - head)
+        return m
+
+    def _pack(self):
+        data = struct.pack("<I", self.hierarchy_id)
+        data += self.baseParam.get_data()
+        data += self.children.get_data()
+        return data
+
+    def get_data(self):
+        data = self._pack()
+        assert_equal(
+            f"Header size and packed data size mismatch for ActorMixer {self.hierarchy_id}", self.size, len(data)
+        )
+        return struct.pack("<BI", self.hierarchy_type, self.size) + data
+
+
+class SwitchGroup:
+    def __init__(self):
+        self.ulSwitchID = 0
+        self.nodeList: list[int] = []
+
+    @classmethod
+    def from_memory_stream(cls, stream: MemoryStream):
+        g = SwitchGroup()
+        g.ulSwitchID = stream.uint32_read()
+        num_items = stream.uint32_read()
+        g.nodeList = [stream.uint32_read() for _ in range(num_items)]
+        return g
+
+    def get_data(self):
+        b = struct.pack("<II", self.ulSwitchID, len(self.nodeList))
+        for node_id in self.nodeList:
+            b += struct.pack("<I", node_id)
+        return b
+
+
+class SwitchParam:
+    """v140 shape: two separate bit-vector bytes (`byBitVectorPlayBack`,
+    `byBitVectorMode`) — v154 merges these into a single byte, see
+    `wwise_hierarchy_154.py`."""
+
+    def __init__(self):
+        self.ulNodeID = 0
+        self.byBitVectorPlayBack = 0
+        self.byBitVectorMode = 0
+        self.fadeOutTime = 0
+        self.fadeInTime = 0
+
+    @classmethod
+    def from_memory_stream(cls, stream: MemoryStream):
+        p = SwitchParam()
+        p.ulNodeID = stream.uint32_read()
+        p.byBitVectorPlayBack = stream.uint8_read()
+        p.byBitVectorMode = stream.uint8_read()
+        p.fadeOutTime = stream.int32_read()
+        p.fadeInTime = stream.int32_read()
+        return p
+
+    def get_data(self):
+        return struct.pack(
+            "<IBBii", self.ulNodeID, self.byBitVectorPlayBack, self.byBitVectorMode, self.fadeOutTime, self.fadeInTime
+        )
+
+
+class MusicSwitchContainer(HircEntry):
+    """Byte layout identical between bank versions. Real upstream's
+    `get_data` has no size-vs-packed-length assertion — replicated as-is."""
+
+    def __init__(self):
+        super().__init__()
+        self.baseParam: BaseParam | None = None
+        self.children = ContainerChildren()
+        self.unused_sections: list[bytes] = [b"", b""]
+
+    @classmethod
+    def from_memory_stream(cls, stream: MemoryStream):
+        c = MusicSwitchContainer()
+        c.hierarchy_type = stream.uint8_read()
+        c.size = stream.uint32_read()
+        start = stream.tell()
+        c.hierarchy_id = stream.uint32_read()
+        c.unused_sections[0] = stream.read(1)
+        c.baseParam = BaseParam.from_memory_stream(stream)
+        c.children = ContainerChildren.from_memory_stream(stream)
+        c.unused_sections[1] = stream.read(c.size - (stream.tell() - start))
+        return c
+
+    def get_data(self):
+        return b"".join(
+            [
+                struct.pack("<BII", self.hierarchy_type, self.size, self.hierarchy_id),
+                self.unused_sections[0],
+                self.baseParam.get_data(),
+                self.children.get_data(),
+                self.unused_sections[1],
+            ]
+        )
+
+
+class SwitchContainer(HircEntry):
+    """Byte layout identical between bank versions except `switchParms`'
+    element type (`SwitchParam`, see above)."""
+
+    def __init__(self):
+        super().__init__()
+        self.baseParam: BaseParam | None = None
+        self.eGroupType = 0
+        self.ulGroupID = 0
+        self.ulDefaultSwitch = 0
+        self.bIsContinuousValidation = 0
+        self.children = ContainerChildren()
+        self.switchGroups: list[SwitchGroup] = []
+        self.switchParms: list[SwitchParam] = []
+
+    @classmethod
+    def from_memory_stream(cls, stream: MemoryStream):
+        s = SwitchContainer()
+        s.hierarchy_type = stream.uint8_read()
+        s.size = stream.uint32_read()
+        head = stream.tell()
+        s.hierarchy_id = stream.uint32_read()
+        s.baseParam = BaseParam.from_memory_stream(stream)
+        s.eGroupType = stream.uint8_read()
+        s.ulGroupID = stream.uint32_read()
+        s.ulDefaultSwitch = stream.uint32_read()
+        s.bIsContinuousValidation = stream.uint8_read()
+        s.children = ContainerChildren.from_memory_stream(stream)
+        num_switch_groups = stream.uint32_read()
+        s.switchGroups = [SwitchGroup.from_memory_stream(stream) for _ in range(num_switch_groups)]
+        num_switch_params = stream.uint32_read()
+        s.switchParms = [SwitchParam.from_memory_stream(stream) for _ in range(num_switch_params)]
+        tail = stream.tell()
+        assert_equal(
+            f"Header size and read data size mismatch for SwitchContainer {s.hierarchy_id}", s.size, tail - head
+        )
+        return s
+
+    def _pack(self):
+        data = struct.pack("<I", self.hierarchy_id)
+        data += self.baseParam.get_data()
+        data += struct.pack(
+            "<BIIB", self.eGroupType, self.ulGroupID, self.ulDefaultSwitch, self.bIsContinuousValidation
+        )
+        data += self.children.get_data()
+        data += struct.pack("<I", len(self.switchGroups))
+        for group in self.switchGroups:
+            data += group.get_data()
+        data += struct.pack("<I", len(self.switchParms))
+        for param in self.switchParms:
+            data += param.get_data()
+        return data
+
+    def get_data(self):
+        data = self._pack()
+        assert_equal(
+            f"Header size and packed data size mismatch for SwitchContainer {self.hierarchy_id}", self.size, len(data)
+        )
+        return struct.pack("<BI", self.hierarchy_type, self.size) + data
+
+
 class HircEntryFactory:
     @classmethod
     def from_memory_stream(cls, stream: MemoryStream):
@@ -1020,10 +1250,18 @@ class HircEntryFactory:
             return Sound.from_memory_stream(stream)
         if hierarchy_type == 0x05:
             return RandomSequenceContainer.from_memory_stream(stream)
+        if hierarchy_type == 0x06:
+            return SwitchContainer.from_memory_stream(stream)
+        if hierarchy_type == 0x07:
+            return ActorMixer.from_memory_stream(stream)
+        if hierarchy_type == 0x09:
+            return LayerContainer.from_memory_stream(stream)
         if hierarchy_type == 0x0A:
             return MusicSegment.from_memory_stream(stream)
         if hierarchy_type == 0x0B:
             return MusicTrack.from_memory_stream(stream)
+        if hierarchy_type == 0x0C:
+            return MusicSwitchContainer.from_memory_stream(stream)
         return HircEntry.from_memory_stream(stream)
 
 
@@ -1059,7 +1297,26 @@ class WwiseHierarchy_140:
         return self.entries[entry_id]
 
     def get_data(self):
+        """Real upstream prunes each of the five container types' child id
+        list down to ids present in `self.entries` before serializing (a
+        child living only in a different bank of the same archive gets
+        silently dropped from *this* bank's output), then restores the
+        original list — verified directly against both
+        `wwise_hierarchy_140.py`/`_154.py`."""
+        containers = [e for e in self.entries.values() if isinstance(e, (ActorMixer, SwitchContainer, RandomSequenceContainer, LayerContainer, MusicSwitchContainer))]
+        saved = [(c, c.children, c.size) for c in containers]
+        for c, children, size in saved:
+            pruned = ContainerChildren()
+            pruned.children = [child for child in children.children if child in self.entries]
+            c.children = pruned
+            c.size = size - 4 * (len(children.children) - len(pruned.children))
+
         arr = [entry.get_data() for entry in self.entries.values()]
+
+        for c, children, size in saved:
+            c.children = children
+            c.size = size
+
         return len(arr).to_bytes(4, byteorder="little") + b"".join(arr)
 
     def import_hierarchy(self, new_hierarchy):

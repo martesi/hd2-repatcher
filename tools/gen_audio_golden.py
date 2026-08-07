@@ -211,6 +211,95 @@ def build_random_sequence_container(version: int, hierarchy_id: int, *, children
     return cntr
 
 
+def build_actor_mixer(version: int, hierarchy_id: int, *, children_ids, num_fx: int = 0):
+    mod = hirc_module(version)
+    m = mod.ActorMixer()
+    m.hierarchy_type = 0x07
+    m.hierarchy_id = hierarchy_id
+    m.baseParam = build_base_param(version, num_fx=num_fx)
+    m.children.children = list(children_ids)
+    m.size = len(m._pack())
+    return m
+
+
+def build_layer_container(version: int, hierarchy_id: int, *, children_ids, layer_data: bytes = b""):
+    mod = hirc_module(version)
+    l = mod.LayerContainer()
+    l.hierarchy_type = 0x09
+    l.hierarchy_id = hierarchy_id
+    l.baseParam = build_base_param(version)
+    l.children.children = list(children_ids)
+    l.layerData = layer_data
+    l.size = len(l._pack())
+    return l
+
+
+def build_switch_group(version: int, switch_id: int, node_list):
+    mod = hirc_module(version)
+    g = mod.SwitchGroup()
+    g.ulSwitchID = switch_id
+    g.nodeList = list(node_list)
+    return g
+
+
+def build_switch_param(version: int, node_id: int, *, fade_out: int = 0, fade_in: int = 0, bit_playback: int = 0, bit_mode: int = 0):
+    """`bit_playback` doubles as v154's single merged `byBitVector` value."""
+    mod = hirc_module(version)
+    p = mod.SwitchParam()
+    p.ulNodeID = node_id
+    p.fadeOutTime = fade_out
+    p.fadeInTime = fade_in
+    if version == 140:
+        p.byBitVectorPlayBack = bit_playback
+        p.byBitVectorMode = bit_mode
+    else:
+        p.byBitVector = bit_playback
+    return p
+
+
+def build_switch_container(
+    version: int,
+    hierarchy_id: int,
+    *,
+    children_ids,
+    group_type: int = 0,
+    group_id: int = 0,
+    default_switch: int = 0,
+    is_continuous_validation: int = 0,
+    switch_groups=None,
+    switch_params=None,
+):
+    mod = hirc_module(version)
+    s = mod.SwitchContainer()
+    s.hierarchy_type = 0x06
+    s.hierarchy_id = hierarchy_id
+    s.baseParam = build_base_param(version)
+    s.eGroupType = group_type
+    s.ulGroupID = group_id
+    s.ulDefaultSwitch = default_switch
+    s.bIsContinuousValidation = is_continuous_validation
+    s.children.children = list(children_ids)
+    s.switchGroups = list(switch_groups or [])
+    s.switchParms = list(switch_params or [])
+    s.size = len(s._pack())
+    return s
+
+
+def build_music_switch_container(version: int, hierarchy_id: int, *, children_ids, unused_byte: int = 0, tail: bytes = b""):
+    mod = hirc_module(version)
+    c = mod.MusicSwitchContainer()
+    c.hierarchy_type = 0x0C
+    c.hierarchy_id = hierarchy_id
+    c.unused_sections = [bytes([unused_byte]), tail]
+    c.baseParam = build_base_param(version)
+    c.children.children = list(children_ids)
+    # MusicSwitchContainer.get_data() doesn't assert on `size` (unlike the
+    # other four container types) — matches `set_data`'s own generic
+    # `self.size = len(self.get_data()) - 5` recompute.
+    c.size = len(c.get_data()) - 5
+    return c
+
+
 def build_bank_audio_source(short_id: int, data: bytes) -> "ac.AudioSource":
     audio = ac.AudioSource()
     audio.stream_type = ac_const.BANK
@@ -660,7 +749,92 @@ def build_phase3_merge_cases():
     print("Done.")
 
 
+def build_phase4_cases():
+    """Phase 4: the four remaining container types (`ActorMixer`,
+    `SwitchContainer`, `LayerContainer`, `MusicSwitchContainer`), plus the
+    two merge mechanisms that apply to all five container types —
+    `GameArchive.load`'s cross-bank children union and
+    `WwiseHierarchy.get_data`'s dangling-child pruning — neither of which
+    phase 3's `RandomSequenceContainer` fixtures exercised."""
+    print("Generating phase-4 container fixtures...")
+
+    for version, case_name, base_id in ((140, "audio_containers_v140", 0xC000_0000), (154, "audio_containers_v154", 0xD000_0000)):
+        mixer = build_actor_mixer(version, base_id | 0x01, children_ids=[base_id | 0x10], num_fx=1)
+        switch = build_switch_container(
+            version,
+            base_id | 0x02,
+            children_ids=[base_id | 0x01],
+            group_type=1,
+            group_id=42,
+            default_switch=base_id | 0x01,
+            is_continuous_validation=1,
+            switch_groups=[build_switch_group(version, 42, [base_id | 0x01, base_id | 0x02])],
+            switch_params=[
+                build_switch_param(version, base_id | 0x01, fade_out=100, fade_in=200, bit_playback=1, bit_mode=1),
+                build_switch_param(version, base_id | 0x02, fade_out=0, fade_in=50, bit_playback=0, bit_mode=0),
+            ],
+        )
+        layer = build_layer_container(version, base_id | 0x03, children_ids=[base_id | 0x02], layer_data=filler(20, seed=base_id))
+        music_switch = build_music_switch_container(
+            version, base_id | 0x04, children_ids=[base_id | 0x03], unused_byte=0x5, tail=filler(9, seed=base_id + 1)
+        )
+        rsc = build_random_sequence_container(
+            version, base_id | 0x05, children_ids=[base_id | 0x04], play_list_items=[(base_id | 0x04, 100)]
+        )
+        leaf = opaque_entry(0x01, base_id | 0x10, filler(6, seed=base_id + 2))
+
+        archive = base_archive("9ba626afa44a3aa3.patch_0")
+        bank = build_bank(base_id | 0x2000, [leaf, mixer, switch, layer, music_switch, rsc], version=version)
+        archive.wwise_banks[base_id | 0x2000] = bank
+        write_case(case_name, archive)
+
+    # --- Cross-bank children union (`GameArchive.load`, `core.py:818-829`):
+    # the same ActorMixer `hierarchy_id` appears in two banks of the same
+    # archive with different (overlapping) children lists; every id each
+    # bank's own list references is defined locally in *both* banks (kept
+    # byte-identical) so dangling-child pruning never masks the merge
+    # itself — this case is purely about the union + cross-bank backfill.
+    for version, case_name, base_id in (
+        (140, "audio_container_children_merge_v140", 0xE000_0000),
+        (154, "audio_container_children_merge_v154", 0xE100_0000),
+    ):
+        leaf_a = opaque_entry(0x01, base_id | 0x01, filler(4, seed=1))
+        leaf_b = opaque_entry(0x01, base_id | 0x02, filler(4, seed=2))
+        leaf_c = opaque_entry(0x01, base_id | 0x03, filler(4, seed=3))
+        mixer_id = base_id | 0x100
+
+        bank1 = build_bank(
+            base_id | 0x2001,
+            [leaf_a, leaf_b, leaf_c, build_actor_mixer(version, mixer_id, children_ids=[base_id | 0x01, base_id | 0x02])],
+            version=version,
+        )
+        bank2 = build_bank(
+            base_id | 0x2002,
+            [leaf_a, leaf_b, leaf_c, build_actor_mixer(version, mixer_id, children_ids=[base_id | 0x02, base_id | 0x03])],
+            version=version,
+        )
+
+        archive = base_archive("9ba626afa44a3aa3.patch_0")
+        archive.wwise_banks[base_id | 0x2001] = bank1
+        archive.wwise_banks[base_id | 0x2002] = bank2
+        write_case(case_name, archive)
+
+    # NOTE: dangling-child pruning (`WwiseHierarchy.get_data`) is NOT
+    # exercisable as an oracle-diffed fixture through this generator's
+    # write_case flow: `GameArchive.to_file` (called both to manufacture
+    # `input.bin` *and* to produce `expected.bin`) always prunes on every
+    # write, so a hand-built dangling child reference never survives even
+    # the very first serialization — there is no "pre-prune" input state
+    # this flow can express. It's covered instead by a pure-Rust unit test
+    # against `WwiseHierarchy::get_data()` directly (no oracle needed for a
+    # simple filter+arithmetic operation) — see
+    # `crates/engine/src/wwise/hierarchy/mod.rs`'s `#[cfg(test)]` module.
+
+    print("Done.")
+
+
 if __name__ == "__main__":
     build_cases()
     build_phase3_roundtrip_cases()
     build_phase3_merge_cases()
+    build_phase4_cases()

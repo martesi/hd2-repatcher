@@ -700,8 +700,40 @@ class GameArchive:
                     hirc.load(bank.chunks["HIRC"])
                 except KeyError:
                     pass
+                # `GameArchive.load`'s cross-bank dedup (verified against
+                # real upstream `core.py:818-837`): a `hierarchy_id` shared
+                # by more than one bank in this archive gets its children
+                # unioned into the first-seen copy (for the five container
+                # types), and every sharing bank's own `hirc.entries[id]`
+                # gets reassigned to that same (shared) object so later
+                # mutations/pruning stay in sync across banks.
+                replacements = {}
                 for hirc_id, hirc_entry in hirc.entries.items():
-                    self.hierarchy_entries[hirc_id] = hirc_entry
+                    if hirc_id in self.hierarchy_entries:
+                        existing_entry = self.hierarchy_entries[hirc_id]
+                        if isinstance(
+                            hirc_entry,
+                            (
+                                wwise_hierarchy_140.ActorMixer,
+                                wwise_hierarchy_140.SwitchContainer,
+                                wwise_hierarchy_140.RandomSequenceContainer,
+                                wwise_hierarchy_140.LayerContainer,
+                                wwise_hierarchy_140.MusicSwitchContainer,
+                                wwise_hierarchy_154.ActorMixer,
+                                wwise_hierarchy_154.SwitchContainer,
+                                wwise_hierarchy_154.RandomSequenceContainer,
+                                wwise_hierarchy_154.LayerContainer,
+                                wwise_hierarchy_154.MusicSwitchContainer,
+                            ),
+                        ):
+                            for child in hirc_entry.children.children:
+                                if child not in existing_entry.children.children:
+                                    existing_entry.children.children.append(child)
+                                    existing_entry.size += 4
+                        replacements[hirc_id] = existing_entry
+                    else:
+                        self.hierarchy_entries[hirc_id] = hirc_entry
+                hirc.entries.update(replacements)
                 entry.hierarchy = hirc
 
                 if "DIDX" in bank.chunks.keys():
