@@ -1032,9 +1032,184 @@ def build_phase5_cases():
     print("Done.")
 
 
+def write_process_audio_patches_case(name: str, gamedata_archives: list, patches: list):
+    """Phase 7: exercises `process_audio_patches`'s whole orchestration —
+    resolving each patch's touched soundbanks to their containing base
+    archive, loading those archives, importing every patch (sorted by
+    name), and writing one combined `9ba626afa44a3aa3.patch_0` — by
+    manually driving the same `ac.Mod` methods `run_patch_cli`
+    (`hd2-audio-modder/audio_modder.py:3647-3737`) does, minus its
+    friendlynames-db lookup: this fixture resolves each soundbank's archive
+    directly from `gamedata_archives`, the same replacement `AudioIndex`
+    provides on the Rust side.
+
+    `gamedata_archives`: fully populated `ac.GameArchive`s representing base
+    game archives, encoded via `to_file` straight into a `gamedata/` folder
+    (the same on-disk shape `GameResources::load`/`AudioIndex` scan — no
+    `base/<archive-name>/` staging subfolder like `write_mod_case` uses).
+    `patches`: fully populated `ac.GameArchive`s encoded into a `patches/`
+    folder as `.patch_N` input files.
+    """
+    case_dir = FIXTURES / name
+    case_dir.mkdir(parents=True, exist_ok=True)
+    gamedata_dir = case_dir / "gamedata"
+    patch_dir = case_dir / "patches"
+    expected_dir = case_dir / "expected"
+    for d in (gamedata_dir, patch_dir, expected_dir):
+        d.mkdir(exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="hd2-audio-orchestration-golden-") as tmp:
+        tmp = Path(tmp)
+
+        def encode(archive, subdir):
+            d = tmp / subdir / archive.name
+            d.mkdir(parents=True)
+            archive.to_file(str(d))
+            return d / archive.name
+
+        gamedata_paths = sorted((encode(a, f"gamedata_{a.name}") for a in gamedata_archives), key=lambda p: p.name)
+        patch_paths = sorted((encode(a, f"patch_{a.name}") for a in patches), key=lambda p: p.name)
+
+        for p in gamedata_paths:
+            for f in p.parent.iterdir():
+                (gamedata_dir / f.name).write_bytes(f.read_bytes())
+        for p in patch_paths:
+            for f in p.parent.iterdir():
+                (patch_dir / f.name).write_bytes(f.read_bytes())
+
+        # Legacy-install marker file `GameResources::load`'s `Slim::init`
+        # checks for on the Rust side; write an empty one if none of the
+        # gamedata archives already used that exact name.
+        if not (gamedata_dir / "9ba626afa44a3aa3").exists():
+            (gamedata_dir / "9ba626afa44a3aa3").write_bytes(b"")
+
+        # Mirror `run_patch_cli`'s archive-resolution step exactly, resolving
+        # each touched soundbank's archive directly instead of through a
+        # friendlynames db.
+        bank_to_archive = {}
+        for a in gamedata_archives:
+            for bank_id in a.get_wwise_banks().keys():
+                bank_to_archive[bank_id] = a.name
+
+        archives_needed: set = set()
+        for p in patch_paths:
+            pc = ac.GameArchive.from_file(str(p))
+            if len(pc.get_text_banks()) > 0:
+                archives_needed.add("9ba626afa44a3aa3")
+            for bank_id in pc.get_wwise_banks().keys():
+                assert bank_id in bank_to_archive, f"[{name}] fixture bug: soundbank {bank_id} has no gamedata archive"
+                archives_needed.add(bank_to_archive[bank_id])
+
+        mod = ac.Mod()
+        for a in sorted(archives_needed):
+            assert mod.load_archive_file(str(gamedata_dir / a)), f"[{name}] failed to load gamedata archive {a}"
+        for p in patch_paths:
+            assert mod.import_patch(str(p)), f"[{name}] failed to import patch {p.name}"
+
+        mod.write_patch(str(expected_dir), "9ba626afa44a3aa3.patch_0")
+
+    meta = {"patch_names": [p.name for p in patch_paths]}
+    (case_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+    print(f"  {name}: ok")
+
+
+def build_phase7_cases():
+    """Phase 7: `lib.rs::process_audio_patches`, the engine orchestration
+    entry point wiring `AudioIndex`-based archive resolution + `Slim`-backed
+    base-archive loading (phase 6) into the `Mod::import_patch`/`write_patch`
+    control flow (phase 5)."""
+    print("Generating phase-7 process_audio_patches fixtures...")
+
+    # --- Case 1: single soundbank archive + the hardcoded text-bank archive,
+    # both resolved from a gamedata scan (not passed in explicitly like
+    # write_mod_case does) — proves both of process_audio_patches's archive-
+    # resolution branches (WWISE_BANK via AudioIndex, TEXT_BANK via the
+    # hardcoded 9ba626afa44a3aa3 name) in one patch.
+    source_id = 0x9101
+    original_bytes = filler(64, seed=301)
+    new_bytes = filler(48, seed=302)
+
+    base_bp = build_base_param(154)
+    set_prop_bundle(154, base_bp, [1], [b"aaaa"])
+    base_sound = build_sound(154, 0xF001, build_bank_source(154, source_id, len(original_bytes)), base_bp)
+    gamedata1 = base_archive("1111111111111111")
+    bank1 = build_bank(0x9001, [base_sound], version=154)
+    bank1.media_index = [source_id]
+    gamedata1.wwise_banks[0x9001] = bank1
+    gamedata1.audio_sources[source_id] = build_bank_audio_source(source_id, original_bytes)
+
+    text_archive = base_archive("9ba626afa44a3aa3")
+    text_archive.text_banks[0x9002] = build_text_bank(0x9002, 1, {1: "old text"})
+
+    patch_bp = build_base_param(154)
+    set_prop_bundle(154, patch_bp, [9], [b"zzzz"])
+    patch_sound = build_sound(154, 0xF001, build_bank_source(154, source_id, len(new_bytes)), patch_bp)
+    patch1 = base_archive("mod_patch_orchestration.patch_0")
+    patch_bank1 = build_bank(0x9001, [patch_sound], version=154)
+    patch_bank1.media_index = [source_id]
+    patch1.wwise_banks[0x9001] = patch_bank1
+    patch1.audio_sources[source_id] = build_bank_audio_source(source_id, new_bytes)
+    patch1.text_banks[0x9002] = build_text_bank(0x9002, 1, {1: "new text"})
+
+    write_process_audio_patches_case(
+        "process_audio_patches_single_archive_and_text_bank",
+        gamedata_archives=[gamedata1, text_archive],
+        patches=[patch1],
+    )
+
+    # --- Case 2: two patches in the same directory, each touching a
+    # *different* base archive's soundbank — proves multi-archive
+    # resolution and that `process_audio_patches`'s own sort-by-path
+    # ordering (matching `sorted(os.listdir(...))`) produces the same
+    # result as this fixture's own `sorted(patch_paths)` order.
+    source_a = 0xA101
+    source_b = 0xB101
+    orig_a = filler(40, seed=401)
+    orig_b = filler(56, seed=402)
+    new_a = filler(40, seed=403)
+    new_b = filler(56, seed=404)
+
+    sound_a = build_sound(154, 0xA001, build_bank_source(154, source_a, len(orig_a)), build_base_param(154))
+    gamedata_a = base_archive("aaaaaaaaaaaaaaaa")
+    bank_a = build_bank(0xA002, [sound_a], version=154)
+    bank_a.media_index = [source_a]
+    gamedata_a.wwise_banks[0xA002] = bank_a
+    gamedata_a.audio_sources[source_a] = build_bank_audio_source(source_a, orig_a)
+
+    sound_b = build_sound(154, 0xB001, build_bank_source(154, source_b, len(orig_b)), build_base_param(154))
+    gamedata_b = base_archive("bbbbbbbbbbbbbbbb")
+    bank_b = build_bank(0xB002, [sound_b], version=154)
+    bank_b.media_index = [source_b]
+    gamedata_b.wwise_banks[0xB002] = bank_b
+    gamedata_b.audio_sources[source_b] = build_bank_audio_source(source_b, orig_b)
+
+    patch_sound_a = build_sound(154, 0xA001, build_bank_source(154, source_a, len(new_a)), build_base_param(154))
+    patch_a = base_archive("mod_patch_multi_a.patch_0")
+    patch_bank_a = build_bank(0xA002, [patch_sound_a], version=154)
+    patch_bank_a.media_index = [source_a]
+    patch_a.wwise_banks[0xA002] = patch_bank_a
+    patch_a.audio_sources[source_a] = build_bank_audio_source(source_a, new_a)
+
+    patch_sound_b = build_sound(154, 0xB001, build_bank_source(154, source_b, len(new_b)), build_base_param(154))
+    patch_b = base_archive("mod_patch_multi_b.patch_0")
+    patch_bank_b = build_bank(0xB002, [patch_sound_b], version=154)
+    patch_bank_b.media_index = [source_b]
+    patch_b.wwise_banks[0xB002] = patch_bank_b
+    patch_b.audio_sources[source_b] = build_bank_audio_source(source_b, new_b)
+
+    write_process_audio_patches_case(
+        "process_audio_patches_multi_archive",
+        gamedata_archives=[gamedata_a, gamedata_b],
+        patches=[patch_a, patch_b],
+    )
+
+    print("Done.")
+
+
 if __name__ == "__main__":
     build_cases()
     build_phase3_roundtrip_cases()
     build_phase3_merge_cases()
     build_phase4_cases()
     build_phase5_cases()
+    build_phase7_cases()

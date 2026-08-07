@@ -22,6 +22,7 @@ pub use slim::Slim;
 
 use rayon::prelude::*;
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Marker file present in legacy Helldivers II `data` installs.
@@ -160,9 +161,17 @@ pub struct PatchResult {
     pub patches_found: usize,
     pub updated: Vec<String>,
     pub no_units: Vec<String>,
-    /// Patch files that carry audio resources (delegated to the external audio
-    /// tool); they no longer land in `no_units`.
+    /// Patch files that carry audio resources; they no longer land in
+    /// `no_units`.
     pub audio: Vec<String>,
+    /// Audio-carrying patch files successfully merged into the game data by
+    /// [`process_audio_patches`]. Not yet populated by
+    /// [`process_patch_files`]/[`process_patch_folder`] — wiring lands with
+    /// phase 8's `src-tauri` integration (`.ref/native-audio-patch-plan.md`).
+    pub audio_updated: Vec<String>,
+    /// Audio-carrying patch files that failed to merge, paired with the
+    /// error message. See [`Self::audio_updated`]'s note on wiring.
+    pub audio_failed: Vec<(String, String)>,
     pub corrupted_files: Vec<String>,
 }
 
@@ -212,4 +221,61 @@ pub fn process_patch_folder(directory: &Path, source: &(impl UnitDataSource + Sy
     let mut result = process_patch_files(&patches, source);
     result.directory = directory.to_string_lossy().into_owned();
     result
+}
+
+/// Native replacement for the external audio tool's headless `run_patch_cli`
+/// (`hd2-audio-modder/audio_modder.py:3647-3737`): merges every audio-carrying
+/// `.patch_N` file in `patches` (a same-directory group — see
+/// `find_audio_dirs`-style grouping, not yet wired into
+/// [`process_patch_files`]/[`process_patch_folder`], see [`PatchResult`]'s
+/// doc) into the base game archives they touch, then writes one combined
+/// `9ba626afa44a3aa3.patch_0` into `dir`. `patches` need not be pre-sorted —
+/// this sorts by path itself, matching Python's `sorted(os.listdir(...))`.
+///
+/// Resolves each touched soundbank's containing base archive via
+/// `resources.audio_index()` (this port's replacement for the external
+/// friendlynames db real upstream's headless CLI downloads); a soundbank
+/// with no indexed archive fails the whole call, matching upstream's
+/// "cannot build a correct patch" early return. A patch carrying any
+/// text-bank strings also pulls in the base `9ba626afa44a3aa3` archive
+/// (upstream hardcodes the same archive for text banks).
+pub fn process_audio_patches(dir: &Path, patches: &[PathBuf], resources: &GameResources) -> Result<(), String> {
+    let mut sorted: Vec<&PathBuf> = patches.iter().collect();
+    sorted.sort();
+
+    let mut archives_to_load: BTreeSet<String> = BTreeSet::new();
+    for path in &sorted {
+        let Some(archive) = wwise::GameArchive::from_patch_file(path) else {
+            return Err(format!("failed to read/parse patch file '{}'", path.display()));
+        };
+        if !archive.text_banks.is_empty() {
+            archives_to_load.insert(LEGACY_MARKER_FILE.to_string());
+        }
+        for bank_id in archive.wwise_banks.keys() {
+            match resources.audio_index().archive_name(*bank_id) {
+                Some(name) => {
+                    archives_to_load.insert(name.to_string());
+                }
+                None => {
+                    return Err(format!(
+                        "unable to locate base archive for soundbank {bank_id} (from '{}'); cannot build a correct patch",
+                        path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut mod_ = wwise::Mod::new();
+    for archive_name in &archives_to_load {
+        mod_.load_base_archive(resources.slim(), archive_name);
+    }
+    for path in &sorted {
+        if !mod_.import_patch(path, true) {
+            return Err(format!("failed to import patch file '{}'", path.display()));
+        }
+    }
+
+    mod_.write_patch(dir, Some("9ba626afa44a3aa3.patch_0"))
+        .map_err(|e| format!("failed to write patch to '{}': {e}", dir.display()))
 }
