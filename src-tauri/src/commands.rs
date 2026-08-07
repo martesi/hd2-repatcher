@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use engine::{settings, GameResources, PatchOutcome};
+use engine::{settings, GameResources, PatchKind, PatchOutcome};
 use rayon::prelude::*;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -27,8 +27,6 @@ pub struct AppState {
 pub struct Config {
     pub game_data_path: Option<String>,
     pub game_data_valid: bool,
-    pub audio_tool_path: Option<String>,
-    pub audio_tool_valid: bool,
     pub theme: Option<String>,
     pub accent: Option<String>,
     /// Number of indexed unit resources (0 until game data is loaded).
@@ -78,16 +76,9 @@ pub fn get_config(app: AppHandle) -> Config {
         .as_ref()
         .map(|p| engine::is_valid_game_data_path(Path::new(p)))
         .unwrap_or(false);
-    let audio_tool_valid = s
-        .audio_tool_path
-        .as_ref()
-        .map(|p| Path::new(p).is_file())
-        .unwrap_or(false);
     Config {
         game_data_path: s.game_data_path,
         game_data_valid,
-        audio_tool_path: s.audio_tool_path,
-        audio_tool_valid,
         theme: s.theme,
         accent: s.accent,
         unit_count: current_unit_count(&app),
@@ -103,23 +94,6 @@ pub fn set_game_path(path: String) -> Result<bool, String> {
     s.game_data_path = Some(path);
     settings::save(&s).map_err(|e| e.to_string())?;
     Ok(valid)
-}
-
-/// Persists the external audio tool path. Returns whether it points at an
-/// existing file, which is the same check the CLI makes before delegating.
-#[tauri::command]
-pub fn set_audio_tool_path(path: String) -> Result<bool, String> {
-    let valid = Path::new(&path).is_file();
-    settings::set_cached_audio_tool_path(&path).map_err(|e| e.to_string())?;
-    Ok(valid)
-}
-
-/// Forgets the configured audio tool, returning to the "not configured" state.
-#[tauri::command]
-pub fn clear_audio_tool_path() -> Result<(), String> {
-    let mut s = settings::load();
-    s.audio_tool_path = None;
-    settings::save(&s).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -199,6 +173,12 @@ fn run_batch(app: AppHandle, id: String, path: String, resources: Arc<GameResour
     );
 
     patches.par_iter().for_each(|p| {
+        // A file carrying audio resources is merged natively in the pass
+        // below, not counted as "skipped" here even if it has no unit data.
+        let is_audio = matches!(
+            engine::classify_patch_file(p),
+            PatchKind::Audio | PatchKind::UnitAndAudio
+        );
         // A malformed patch must not take down the GUI; treat a panic as corrupt.
         let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
             engine::update_patch_file(p, &*resources)
@@ -210,7 +190,9 @@ fn run_batch(app: AppHandle, id: String, path: String, resources: Arc<GameResour
                 updated.fetch_add(1, Ordering::Relaxed);
             }
             PatchOutcome::NoUnits => {
-                skipped.fetch_add(1, Ordering::Relaxed);
+                if !is_audio {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                }
             }
             PatchOutcome::Corrupted => {
                 corrupted.lock().unwrap().push(p.to_string_lossy().into_owned());
@@ -232,31 +214,28 @@ fn run_batch(app: AppHandle, id: String, path: String, resources: Arc<GameResour
         );
     });
 
-    // Delegate every directory that directly holds audio patches to the
-    // configured external audio tool, mirroring the CLI's second pass.
-    let audio_dirs = audio::find_audio_dirs(&dir);
-    let mut audio_delegated = 0usize;
-    if !audio_dirs.is_empty() {
-        let s = settings::load();
-        let tool = s.audio_tool_path.map(PathBuf::from).filter(|p| p.is_file());
-        match (tool, s.game_data_path) {
-            (Some(tool), Some(game_path)) => {
-                let game_path = PathBuf::from(game_path);
-                for (adir, patches) in &audio_dirs {
-                    match audio::repatch_audio_dir(&tool, &game_path, adir, patches) {
-                        Ok(_) => audio_delegated += patches.len(),
-                        Err(e) => corrupted.lock().unwrap().push(e),
-                    }
-                }
+    // Natively merge every directory that directly holds audio patches into
+    // the game data, mirroring the CLI's second pass.
+    let mut audio_updated = 0usize;
+    for (adir, apatches) in engine::find_audio_dirs(&dir) {
+        // A malformed/incomplete mod must not take down the GUI; treat a
+        // panic as a failure for this directory, matching the per-file
+        // handling above.
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            engine::process_audio_patches(&adir, &apatches, &resources)
+        }))
+        .unwrap_or_else(|_| Err("panicked while processing (malformed or incomplete mod?)".to_string()));
+        match outcome {
+            Ok(()) => {
+                let stale: Vec<PathBuf> = apatches
+                    .iter()
+                    .filter(|p| p.file_name().is_none_or(|n| n != "9ba626afa44a3aa3.patch_0"))
+                    .cloned()
+                    .collect();
+                audio::remove_stale_audio_files(&stale);
+                audio_updated += apatches.len();
             }
-            _ => {
-                let total: usize = audio_dirs.iter().map(|(_, p)| p.len()).sum();
-                corrupted.lock().unwrap().push(format!(
-                    "{total} audio patch file(s) across {} folder(s) found but no audio tool is \
-                     configured; set it in Settings",
-                    audio_dirs.len()
-                ));
-            }
+            Err(e) => corrupted.lock().unwrap().push(e),
         }
     }
 
@@ -271,7 +250,7 @@ fn run_batch(app: AppHandle, id: String, path: String, resources: Arc<GameResour
             checked: patches_found,
             updated: updated.load(Ordering::Relaxed),
             skipped: skipped.load(Ordering::Relaxed),
-            audio: audio_delegated,
+            audio: audio_updated,
             corrupted: corrupted.clone(),
         },
     );
@@ -282,7 +261,7 @@ fn run_batch(app: AppHandle, id: String, path: String, resources: Arc<GameResour
         patches_found,
         updated: updated.load(Ordering::Relaxed),
         skipped: skipped.load(Ordering::Relaxed),
-        audio: audio_delegated,
+        audio: audio_updated,
         corrupted,
     }
 }

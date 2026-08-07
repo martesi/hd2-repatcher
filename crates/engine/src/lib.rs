@@ -153,6 +153,46 @@ fn collect_patch_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Walks `root` and returns, for every directory that *directly* contains at
+/// least one audio-carrying patch file, that directory paired with its sorted
+/// audio patch files. Each group is one [`process_audio_patches`] call: the
+/// native merge, like the external audio tool it replaces, is non-recursive
+/// and combines everything in a directory into one output patch.
+pub fn find_audio_dirs(root: &Path) -> Vec<(PathBuf, Vec<PathBuf>)> {
+    let mut out = Vec::new();
+    collect_audio_dirs(root, &mut out);
+    out
+}
+
+fn collect_audio_dirs(dir: &Path, out: &mut Vec<(PathBuf, Vec<PathBuf>)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut audio_here: Vec<PathBuf> = Vec::new();
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            subdirs.push(path);
+        } else if path
+            .extension()
+            .map(|e| e.to_string_lossy().contains("patch"))
+            .unwrap_or(false)
+            && matches!(classify_patch_file(&path), PatchKind::Audio | PatchKind::UnitAndAudio)
+        {
+            audio_here.push(path);
+        }
+    }
+    if !audio_here.is_empty() {
+        audio_here.sort();
+        out.push((dir.to_path_buf(), audio_here));
+    }
+    subdirs.sort();
+    for sub in subdirs {
+        collect_audio_dirs(&sub, out);
+    }
+}
+
 /// Aggregated result of processing a folder of patch files. Field names mirror
 /// the Python `PatchResult` dataclass.
 #[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
@@ -165,9 +205,12 @@ pub struct PatchResult {
     /// `no_units`.
     pub audio: Vec<String>,
     /// Audio-carrying patch files successfully merged into the game data by
-    /// [`process_audio_patches`]. Not yet populated by
-    /// [`process_patch_files`]/[`process_patch_folder`] — wiring lands with
-    /// phase 8's `src-tauri` integration (`.ref/native-audio-patch-plan.md`).
+    /// [`process_audio_patches`]. Populated by the `src-tauri` layer (`cli.rs`,
+    /// `commands.rs`), which groups `audio`/`no_units`-adjacent files via
+    /// [`find_audio_dirs`] and calls [`process_audio_patches`] per group —
+    /// not by [`process_patch_files`]/[`process_patch_folder`] themselves,
+    /// since those stay generic over [`UnitDataSource`] alone (audio merging
+    /// needs a concrete [`GameResources`] for its archive index).
     pub audio_updated: Vec<String>,
     /// Audio-carrying patch files that failed to merge, paired with the
     /// error message. See [`Self::audio_updated`]'s note on wiring.

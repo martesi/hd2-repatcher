@@ -14,8 +14,6 @@ pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub game_data_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub audio_tool_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accent: Option<String>,
@@ -59,15 +57,5 @@ pub fn get_cached_game_data_path() -> Option<String> {
 pub fn set_cached_game_data_path(path: &str) -> std::io::Result<()> {
     let mut settings = load();
     settings.game_data_path = Some(path.to_string());
-    save(&settings)
-}
-
-pub fn get_cached_audio_tool_path() -> Option<String> {
-    load().audio_tool_path
-}
-
-pub fn set_cached_audio_tool_path(path: &str) -> std::io::Result<()> {
-    let mut settings = load();
-    settings.audio_tool_path = Some(path.to_string());
     save(&settings)
 }

@@ -19,10 +19,10 @@ fn main() {
             std::process::exit(cli::run(args));
         }
 
-        // `--game` / `--audio-tool` without a patch folder is an error, matching
-        // the Python CLI (config-only invocations still need a folder to act on).
-        if args.game.is_some() || args.audio_tool.is_some() {
-            eprintln!("error: at least one PATCH_FOLDER is required with -g/--game or --audio-tool");
+        // `--game` without a patch folder is an error, matching the Python CLI
+        // (config-only invocations still need a folder to act on).
+        if args.game.is_some() {
+            eprintln!("error: at least one PATCH_FOLDER is required with -g/--game");
             std::process::exit(2);
         }
 

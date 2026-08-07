@@ -1,6 +1,7 @@
 //! Headless CLI mode — a faithful port of `reference/cli.py`. Runs when the
 //! binary is launched with arguments; the GUI is never created in this path.
 
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
@@ -9,6 +10,11 @@ use engine::{settings, GameResources, PatchResult};
 use crate::audio;
 
 pub mod console;
+
+/// Filename `engine::process_audio_patches` always writes its merged output
+/// as. Excluded from stale-file cleanup so a per-mod input that happens to
+/// already have this exact name isn't deleted out from under its own output.
+const MERGED_AUDIO_PATCH_NAME: &str = "9ba626afa44a3aa3.patch_0";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -24,10 +30,6 @@ pub struct Args {
     /// do not save or overwrite the cached game data path
     #[arg(long = "no-game-path-caching")]
     pub no_game_path_caching: bool,
-
-    /// path to the external audio tool executable; also cached for future runs
-    #[arg(long = "audio-tool", value_name = "PATH")]
-    pub audio_tool: Option<String>,
 
     /// write repatched copies into DIR (one <name> subfolder per input folder)
     /// instead of modifying the originals in place
@@ -49,7 +51,7 @@ fn absolute(p: &str) -> PathBuf {
 }
 
 /// Runs the CLI and returns the process exit code (non-zero if any corrupted
-/// patch files were found or an argument was invalid).
+/// or audio patch files failed to process, or an argument was invalid).
 pub fn run(args: Args) -> i32 {
     let mut game_path: Option<PathBuf> = None;
     if let Some(g) = &args.game {
@@ -71,23 +73,10 @@ pub fn run(args: Args) -> i32 {
         game_path = Some(p);
     }
 
-    // Resolve + cache the audio tool path (mirrors the -g caching block above).
-    let mut audio_tool: Option<PathBuf> = None;
-    if let Some(t) = &args.audio_tool {
-        let p = absolute(t);
-        if !p.is_file() {
-            eprintln!("error: '{t}' is not an executable file");
-            return 1;
-        }
-        let _ = settings::set_cached_audio_tool_path(&p.to_string_lossy());
-        println!("Audio tool set to: {}", p.display());
-        audio_tool = Some(p);
-    }
-
-    run_cli(game_path, audio_tool, &args)
+    run_cli(game_path, &args)
 }
 
-fn run_cli(game_path: Option<PathBuf>, audio_tool: Option<PathBuf>, args: &Args) -> i32 {
+fn run_cli(game_path: Option<PathBuf>, args: &Args) -> i32 {
     let game_path = match game_path {
         Some(p) => p,
         None => match settings::get_cached_game_data_path() {
@@ -98,13 +87,6 @@ fn run_cli(game_path: Option<PathBuf>, audio_tool: Option<PathBuf>, args: &Args)
             }
         },
     };
-
-    // Fall back to the cached audio tool path when the flag was not passed.
-    let audio_tool = audio_tool.or_else(|| {
-        settings::get_cached_audio_tool_path()
-            .map(PathBuf::from)
-            .filter(|p| p.is_file())
-    });
 
     println!("Loading game resources from: {}", game_path.display());
     let resources = GameResources::load(&game_path);
@@ -138,41 +120,61 @@ fn run_cli(game_path: Option<PathBuf>, audio_tool: Option<PathBuf>, args: &Args)
             src.clone()
         };
 
-        // 1. Unit patching on the working dir.
-        let result = engine::process_patch_folder(&work_dir, &resources);
+        // 1. Unit patching on the working dir (also classifies audio-carrying
+        // files into `result.audio`, but doesn't merge them).
+        let mut result = engine::process_patch_folder(&work_dir, &resources);
         if !result.corrupted_files.is_empty() {
             exit_code = 1;
         }
 
-        // 2. Delegate each directory that directly holds audio patches.
-        let audio_dirs = audio::find_audio_dirs(&work_dir);
-        if !audio_dirs.is_empty() {
-            match &audio_tool {
-                Some(tool) => {
-                    for (dir, patches) in &audio_dirs {
-                        if let Err(e) = audio::repatch_audio_dir(tool, &game_path, dir, patches) {
-                            eprintln!("error: {e}");
-                            exit_code = 1;
-                        }
-                    }
-                }
-                None => {
-                    eprintln!(
-                        "error: '{}' contains {} audio patch folder(s) but no audio tool is \
-                         configured; pass --audio-tool <path>",
-                        src.display(),
-                        audio_dirs.len()
-                    );
-                    exit_code = 1;
-                }
-            }
+        // 2. Natively merge each directory that directly holds audio patches.
+        if !merge_audio_dirs(&work_dir, &resources, &mut result) {
+            exit_code = 1;
         }
 
         let dest = copy.then(|| work_dir.clone());
-        let delegated = audio_tool.is_some();
-        print_cli_result(&src, dest.as_deref(), &result, &audio_dirs, delegated);
+        print_cli_result(&src, dest.as_deref(), &result);
     }
     exit_code
+}
+
+/// Merges every audio-patch directory under `work_dir` via
+/// `engine::process_audio_patches`, filling `result.audio_updated`/
+/// `audio_failed`. Returns `false` if any group failed.
+fn merge_audio_dirs(work_dir: &Path, resources: &GameResources, result: &mut PatchResult) -> bool {
+    let mut ok = true;
+    for (dir, patches) in engine::find_audio_dirs(work_dir) {
+        // A malformed/incomplete mod (e.g. a `.patch_N` missing its required
+        // `.stream` companion) must not take down the whole run; treat a
+        // panic as a per-directory failure, matching how a corrupt unit
+        // patch is handled.
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            engine::process_audio_patches(&dir, &patches, resources)
+        }))
+        .unwrap_or_else(|_| Err("panicked while processing (malformed or incomplete mod?)".to_string()));
+        match outcome {
+            Ok(()) => {
+                let stale: Vec<PathBuf> = patches
+                    .iter()
+                    .filter(|p| p.file_name().is_none_or(|n| n != MERGED_AUDIO_PATCH_NAME))
+                    .cloned()
+                    .collect();
+                audio::remove_stale_audio_files(&stale);
+                result
+                    .audio_updated
+                    .extend(patches.iter().map(|p| p.to_string_lossy().into_owned()));
+            }
+            Err(e) => {
+                ok = false;
+                for p in &patches {
+                    result
+                        .audio_failed
+                        .push((p.to_string_lossy().into_owned(), e.clone()));
+                }
+            }
+        }
+    }
+    ok
 }
 
 /// Computes the copy destination for a mod folder: `<output>/<name>` when
@@ -189,13 +191,7 @@ fn output_dest(src: &Path, output: Option<&str>) -> PathBuf {
     }
 }
 
-fn print_cli_result(
-    directory: &Path,
-    dest: Option<&Path>,
-    result: &PatchResult,
-    audio_dirs: &[(PathBuf, Vec<PathBuf>)],
-    delegated: bool,
-) {
+fn print_cli_result(directory: &Path, dest: Option<&Path>, result: &PatchResult) {
     println!("\n{}", directory.display());
     if let Some(dest) = dest {
         println!("  Repatched copy written to: {}", dest.display());
@@ -209,20 +205,19 @@ fn print_cli_result(
         "  Updated {} patch file(s) containing unit resources",
         result.updated.len()
     );
-    if !result.audio.is_empty() {
-        if delegated {
-            println!(
-                "  Delegated {} audio patch file(s) across {} folder(s) to the audio tool",
-                result.audio.len(),
-                audio_dirs.len()
-            );
-        } else {
-            println!(
-                "  Found {} audio patch file(s) across {} folder(s) but skipped them \
-                 (no audio tool configured)",
-                result.audio.len(),
-                audio_dirs.len()
-            );
+    if !result.audio_updated.is_empty() {
+        println!(
+            "  Patched {} audio patch file(s)",
+            result.audio_updated.len()
+        );
+    }
+    if !result.audio_failed.is_empty() {
+        eprintln!(
+            "  Failed to patch {} audio patch file(s):",
+            result.audio_failed.len()
+        );
+        for (name, err) in &result.audio_failed {
+            eprintln!("    {name}: {err}");
         }
     }
     if !result.no_units.is_empty() {
