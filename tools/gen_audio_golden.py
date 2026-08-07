@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Generate differential golden fixtures for the Rust audio-patching port
-(phase 1: TOC/archive skeleton, opaque HIRC only).
+(phases 1-2: TOC/archive skeleton with opaque HIRC, plus structured `Sound`/
+`BaseParam` and DIDX/DATA regeneration).
 
 Builds a small synthetic `GameArchive` (via the reference oracle's own
 encoder — a legitimate way to manufacture a well-formed input archive; the
@@ -34,7 +35,66 @@ sys.modules.setdefault("lz4.block", _fake_lz4.block)
 sys.path.insert(0, str(REFERENCE))
 import audio_core as ac  # noqa: E402
 import audio_const as ac_const  # noqa: E402
+import wwise_hierarchy_140 as h140  # noqa: E402
+import wwise_hierarchy_154 as h154  # noqa: E402
 from wwise_hierarchy_140 import HircEntry, WwiseHierarchy_140  # noqa: E402
+
+
+def hirc_module(version: int):
+    return h154 if version == 154 else h140
+
+
+def build_bank_source(version: int, source_id: int, mem_size: int, plugin_id=None):
+    """A `BankSourceStruct` for the given bank version, defaulting to a
+    BANK-embedded VORBIS source (the common case DIDX/DATA regeneration
+    exercises)."""
+    mod = hirc_module(version)
+    src = mod.BankSourceStruct()
+    src.plugin_id = ac_const.VORBIS if plugin_id is None else plugin_id
+    src.stream_type = ac_const.BANK
+    src.source_id = source_id
+    src.mem_size = mem_size
+    src.bit_flags = 0
+    if version == 154:
+        src.cache_id = 0
+    return src
+
+
+def build_base_param(version: int, *, num_fx: int = 0):
+    """A minimal-but-valid `BaseParam`: every list/count defaults to empty
+    (matching upstream's own `__init__` defaults), except
+    `positioningParamData`, which must contain at least the one
+    "no positioning" flag byte `parse_positioning_params` always reads."""
+    mod = hirc_module(version)
+    bp = mod.BaseParam()
+    bp.positioningParamData = b"\x00"
+    if num_fx > 0:
+        bp.uNumFx = num_fx
+        if version == 154:
+            bp.fxChunks = [mod.FxChunk(i, 1000 + i, 0x07) for i in range(num_fx)]
+        else:
+            bp.fxChunks = [mod.FxChunk(i, 1000 + i, 1, 0) for i in range(num_fx)]
+            bp.bitsFxBypass = 0xAB
+    return bp
+
+
+def build_sound(version: int, hierarchy_id: int, source, base_param):
+    mod = hirc_module(version)
+    s = mod.Sound()
+    s.hierarchy_type = 0x02
+    s.hierarchy_id = hierarchy_id
+    s.sources = [source]
+    s.baseParam = base_param
+    s.size = len(s._pack())
+    return s
+
+
+def build_bank_audio_source(short_id: int, data: bytes) -> "ac.AudioSource":
+    audio = ac.AudioSource()
+    audio.stream_type = ac_const.BANK
+    audio.short_id = short_id
+    audio.set_data(bytearray(data), set_modified=False)
+    return audio
 
 
 def filler(n: int, seed: int = 0) -> bytes:
@@ -208,6 +268,67 @@ def build_cases():
         b,
         mutate=({"stream_id": 0x5555, "new_data_hex": new_bytes.hex()}, swap),
     )
+
+    # Case 3 (phase 2): a `Sound` HIRC entry with a BANK-embedded VORBIS
+    # source — exercises structured Sound/BaseParam parsing and the
+    # DIDX/DATA regeneration loop in `WwiseBank.generate`. Round trip only;
+    # proves regeneration reproduces the original bytes exactly.
+    sound_source_id = 0x7777
+    original_bytes = filler(96, seed=20)
+
+    c = base_archive("9ba626afa44a3aa3.patch_0")
+    sound = build_sound(140, 0xCCCC0001, build_bank_source(140, sound_source_id, len(original_bytes)), build_base_param(140))
+    sound_bank = build_bank(0x8888, [sound], version=140)
+    sound_bank.media_index = [sound_source_id]
+    c.wwise_banks[0x8888] = sound_bank
+    c.audio_sources[sound_source_id] = build_bank_audio_source(sound_source_id, original_bytes)
+    write_case("audio_sound_bank_source", c)
+
+    # Case 4: same shape, but the underlying audio bytes are swapped after
+    # loading — through `audio_sources` (short_id-keyed), not `wwise_streams`
+    # — with a deliberately *different* length, proving DIDX/DATA offsets
+    # and sizes are re-derived from the new data rather than cached.
+    d = base_archive("9ba626afa44a3aa3.patch_0")
+    sound2 = build_sound(140, 0xDDDD0001, build_bank_source(140, sound_source_id, len(original_bytes)), build_base_param(140))
+    sound_bank2 = build_bank(0x9999, [sound2], version=140)
+    sound_bank2.media_index = [sound_source_id]
+    d.wwise_banks[0x9999] = sound_bank2
+    d.audio_sources[sound_source_id] = build_bank_audio_source(sound_source_id, original_bytes)
+
+    new_sound_bytes = filler(40, seed=21)
+
+    def swap_bank_audio(archive):
+        archive.audio_sources[sound_source_id].set_data(bytearray(new_sound_bytes))
+
+    write_case(
+        "audio_sound_bank_source_swap",
+        d,
+        mutate=({"short_id": sound_source_id, "new_data_hex": new_sound_bytes.hex()}, swap_bank_audio),
+    )
+
+    # Case 5: bank version 154 — exercises the real layout divergences found
+    # by diffing upstream's wwise_hierarchy_140.py/_154.py: BankSourceStruct's
+    # cache_id, FxChunk's packed bitVector byte (vs v140's two separate
+    # bytes) via uNumFx>0 (also exercises the bBypassAll/bPypassAll upstream
+    # bug — see wwise_hierarchy_154.py's module docstring), and a
+    # StateGroupState with a non-empty AkPropBundle list (v140's
+    # StateGroupState has no such list at all).
+    v154_source_id = 0x6001
+    v154_bytes = filler(52, seed=30)
+
+    bp = build_base_param(154, num_fx=2)
+    ak_props = [h154.AkPropBundle(5, 1.5), h154.AkPropBundle(9, -2.25)]
+    state = h154.StateGroupState(0x42, len(ak_props), ak_props)
+    bp.stateParams.ulNumStateGroups = 1
+    bp.stateParams.stateGroups = [h154.StateGroup(0x99, 1, 1, [state])]
+
+    e = base_archive("9ba626afa44a3aa3.patch_0")
+    v154_sound = build_sound(154, 0xEEEE0001, build_bank_source(154, v154_source_id, len(v154_bytes)), bp)
+    v154_bank = build_bank(0x8001, [v154_sound], version=154)
+    v154_bank.media_index = [v154_source_id]
+    e.wwise_banks[0x8001] = v154_bank
+    e.audio_sources[v154_source_id] = build_bank_audio_source(v154_source_id, v154_bytes)
+    write_case("audio_sound_v154_fx_state", e)
 
     print("Done.")
 

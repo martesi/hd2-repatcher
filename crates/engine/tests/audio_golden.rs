@@ -1,5 +1,6 @@
-//! Differential golden tests for the audio-patching port (phase 1: TOC/archive
-//! skeleton, opaque HIRC only). Replays fixtures produced by
+//! Differential golden tests for the audio-patching port (phases 1-2:
+//! TOC/archive skeleton with opaque HIRC, plus structured `Sound`/`BaseParam`
+//! and DIDX/DATA regeneration). Replays fixtures produced by
 //! `tools/gen_audio_golden.py` through the Rust port and asserts byte-for-byte
 //! identical output against the reference Python engine
 //! (`reference/audio_core.py`). Regenerate fixtures with
@@ -39,14 +40,23 @@ fn run_case(dir: &Path) {
     let mut archive = GameArchive::from_patch_file(&input_path).expect("fixture archive should load");
 
     if let Some(mutation) = meta.get("mutation").filter(|m| !m.is_null() && m.as_object().is_some_and(|o| !o.is_empty())) {
-        let stream_id = mutation["stream_id"].as_u64().unwrap();
         let new_data = hex_decode(mutation["new_data_hex"].as_str().unwrap());
-        archive
-            .wwise_streams
-            .get_mut(&stream_id)
-            .expect("mutation targets a stream present in the fixture")
-            .audio_source
-            .set_data(new_data, true);
+        if let Some(stream_id) = mutation.get("stream_id").and_then(|v| v.as_u64()) {
+            archive
+                .wwise_streams
+                .get_mut(&stream_id)
+                .expect("mutation targets a stream present in the fixture")
+                .audio_source
+                .set_data(new_data, true);
+        } else if let Some(short_id) = mutation.get("short_id").and_then(|v| v.as_u64()) {
+            archive
+                .audio_sources
+                .get_mut(&short_id)
+                .expect("mutation targets an audio source present in the fixture")
+                .set_data(new_data, true);
+        } else {
+            panic!("[{name}] mutation object has neither stream_id nor short_id");
+        }
     }
 
     let output_dir = std::env::temp_dir().join(format!("hd2-audio-golden-out-{name}-{}", std::process::id()));

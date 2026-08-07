@@ -2,18 +2,40 @@
 //! read/write skeleton. A `GameArchive` is either a base game archive or a
 //! mod `.patch_N` file; both share this exact on-disk shape.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use indexmap::IndexMap;
 
 use crate::memstream::MemoryStream;
-use crate::wwise::audio_source::{AudioSource, WwiseDep, WwiseStream, STREAM_TYPE_STREAM};
+use crate::wwise::audio_source::{
+    AudioSource, WwiseDep, WwiseStream, STREAM_TYPE_BANK, STREAM_TYPE_PREFETCH, STREAM_TYPE_STREAM,
+};
 use crate::wwise::bank_parser::{BankParser, MediaIndex};
 use crate::wwise::hierarchy::{BankVersion, HircEntry, WwiseHierarchy};
 use crate::wwise::text_bank::TextBank;
 use crate::wwise::video::VideoSource;
-use crate::wwise::BANK_VERSION_KEY;
+use crate::wwise::{murmur64_hash, BANK_VERSION_KEY, REV_AUDIO, VORBIS};
 use crate::{BINK_VIDEO, TEXT_BANK, WWISE_BANK, WWISE_DEP, WWISE_STREAM};
+
+/// `os.path.dirname` for the POSIX-style `/`-separated virtual paths used by
+/// bank dependency strings (never real filesystem paths, so `std::path::Path`
+/// — which is host-OS-semantics-dependent — would be the wrong tool here).
+/// Matches CPython's `posixpath.dirname` exactly, including its trailing-slash
+/// collapsing, since a wrong dirname would silently mis-hash a stream lookup.
+fn posix_dirname(path: &str) -> &str {
+    match path.rfind('/') {
+        None => "",
+        Some(i) => {
+            let head = &path[..=i];
+            if head.bytes().all(|b| b == b'/') {
+                head
+            } else {
+                head.trim_end_matches('/')
+            }
+        }
+    }
+}
 
 const ARCHIVE_MAGIC: u32 = 0xF000_0011;
 
@@ -117,6 +139,12 @@ pub struct WwiseBank {
     modified_count: u32,
     pub dep: WwiseDep,
     pub hierarchy: WwiseHierarchy,
+    /// This bank's own DIDX media ids (`None` if it had no DIDX chunk at
+    /// all). `generate` uses this to gate which `Sound`/`MusicTrack`
+    /// sources it re-embeds — see the comment there for the exact (and
+    /// slightly quirky) None/empty/non-empty semantics it replicates from
+    /// Python.
+    pub media_index: Option<Vec<u32>>,
 }
 
 impl WwiseBank {
@@ -138,13 +166,86 @@ impl WwiseBank {
         }
     }
 
-    /// `WwiseBank.generate`: regenerates the bank blob from its hierarchy.
-    /// The Python DIDX/DATA regeneration loop (walking `Sound`/`MusicTrack`
-    /// sources) is not ported yet — those HIRC types don't exist until a
-    /// later phase, and until then `hierarchy.sounds()`/`.music_tracks()`
-    /// are always empty, so that loop can never produce output yet either.
-    pub fn generate(&self) -> Vec<u8> {
+    /// `WwiseBank.generate`: regenerates the bank blob from its hierarchy,
+    /// including the DIDX/DATA re-embedding loop over `Sound`'s (and, once
+    /// phase 3 ports it, `MusicTrack`'s) audio sources.
+    pub fn generate(&self, audio_sources: &IndexMap<u64, AudioSource>) -> Vec<u8> {
         let mut data = self.bank_header.clone();
+
+        let mut offset: u32 = 0;
+        let mut didx_array: Vec<[u8; 12]> = Vec::new();
+        let mut data_array: Vec<&[u8]> = Vec::new();
+        let mut added_sources: HashSet<u32> = HashSet::new();
+
+        // `hierarchy.music_tracks()` is unconditionally empty until phase 3
+        // ports MusicTrack, matching Python's `get_sounds() + get_music_tracks()`.
+        for sound in self.hierarchy.sounds() {
+            for source in &sound.sources {
+                if source.plugin_id == VORBIS {
+                    // Python: `if self.media_index and source_id not in
+                    // self.media_index: continue` — an *empty* (but present)
+                    // media_index is falsy in Python, so it does NOT filter
+                    // anything out (this only matters for a bank whose DIDX
+                    // chunk existed but had zero entries). Replicated as-is.
+                    let Some(media_index) = &self.media_index else {
+                        continue;
+                    };
+                    if !media_index.is_empty() && !media_index.contains(&source.source_id) {
+                        continue;
+                    }
+
+                    let Some(audio) = audio_sources.get(&(source.source_id as u64)) else {
+                        continue;
+                    };
+
+                    if source.stream_type as u32 == STREAM_TYPE_PREFETCH && !added_sources.contains(&source.source_id) {
+                        let mem_size = source.mem_size as usize;
+                        data_array.push(&audio.data[..mem_size.min(audio.data.len())]);
+                        didx_array.push(didx_entry(source.source_id, offset, source.mem_size));
+                        offset += source.mem_size;
+                        added_sources.insert(source.source_id);
+                    } else if source.stream_type as u32 == STREAM_TYPE_BANK && !added_sources.contains(&source.source_id) {
+                        data_array.push(&audio.data);
+                        didx_array.push(didx_entry(source.source_id, offset, audio.data.len() as u32));
+                        offset += audio.data.len() as u32;
+                        added_sources.insert(source.source_id);
+                    }
+                } else if source.plugin_id == REV_AUDIO {
+                    let Some(entry) = self.hierarchy.get_entry(source.source_id) else {
+                        continue;
+                    };
+                    let fx_data = entry.get_data();
+                    let Some(media_index_id) = rev_audio_media_index_id(&fx_data) else {
+                        continue;
+                    };
+                    let Some(audio) = audio_sources.get(&(media_index_id as u64)) else {
+                        continue;
+                    };
+
+                    if source.stream_type as u32 == STREAM_TYPE_BANK && !added_sources.contains(&media_index_id) {
+                        data_array.push(&audio.data);
+                        didx_array.push(didx_entry(media_index_id, offset, audio.data.len() as u32));
+                        offset += audio.data.len() as u32;
+                        added_sources.insert(media_index_id);
+                    }
+                }
+            }
+        }
+
+        if !didx_array.is_empty() {
+            data.extend_from_slice(b"DIDX");
+            data.extend_from_slice(&((didx_array.len() * 12) as u32).to_le_bytes());
+            for entry in &didx_array {
+                data.extend_from_slice(entry);
+            }
+            data.extend_from_slice(b"DATA");
+            let total: u32 = data_array.iter().map(|d| d.len() as u32).sum();
+            data.extend_from_slice(&total.to_le_bytes());
+            for chunk in &data_array {
+                data.extend_from_slice(chunk);
+            }
+        }
+
         let hierarchy_section = self.hierarchy.get_data();
         data.extend_from_slice(b"HIRC");
         data.extend_from_slice(&(hierarchy_section.len() as u32).to_le_bytes());
@@ -152,6 +253,27 @@ impl WwiseBank {
         data.extend_from_slice(&self.bank_misc_data);
         data
     }
+}
+
+fn didx_entry(id: u32, offset: u32, size: u32) -> [u8; 12] {
+    let mut out = [0u8; 12];
+    out[0..4].copy_from_slice(&id.to_le_bytes());
+    out[4..8].copy_from_slice(&offset.to_le_bytes());
+    out[8..12].copy_from_slice(&size.to_le_bytes());
+    out
+}
+
+/// `int.from_bytes(fx_data[19+plugin_param_size:23+plugin_param_size], ...)`:
+/// a `REV_AUDIO` source's `source_id` points at an opaque `FxCustom` HIRC
+/// entry; the media index id it actually needs lives at a fixed offset past
+/// that entry's plugin-param blob, read straight out of its raw
+/// `get_data()` bytes (type+size+id+misc header included) rather than a
+/// dedicated parsed structure — `FxCustom` (0x11) is one of the many HIRC
+/// types that stay opaque even in the real upstream tool.
+fn rev_audio_media_index_id(fx_data: &[u8]) -> Option<u32> {
+    let plugin_param_size = u32::from_le_bytes(fx_data.get(13..17)?.try_into().unwrap()) as usize;
+    let bytes = fx_data.get(19 + plugin_param_size..23 + plugin_param_size)?;
+    Some(u32::from_le_bytes(bytes.try_into().unwrap()))
 }
 
 /// Port of `GameArchive`.
@@ -222,6 +344,12 @@ impl GameArchive {
         toc.seek(toc.tell() + 32 * num_types as usize);
         let toc_start = toc.tell();
 
+        // Accumulates every bank's DIDX/DATA across the whole archive (a
+        // Sound in one bank can reference media that physically lives in
+        // another bank's DIDX/DATA); used only after the loop, to resolve
+        // `self.audio_sources`.
+        let mut archive_media_index = MediaIndex::default();
+
         for n in 0..num_files as usize {
             toc.seek(toc_start + n * 80);
             let header = TocHeader::read(&mut toc);
@@ -269,10 +397,16 @@ impl GameArchive {
                     self.hierarchy_entries.insert(*id, entry.clone());
                 }
 
-                if parser.chunks.contains_key("DIDX") {
-                    let mut mi = MediaIndex::default();
-                    mi.load(parser.get_chunk("DIDX"), parser.get_chunk("DATA"));
-                }
+                let media_index = if parser.chunks.contains_key("DIDX") {
+                    let didx = parser.get_chunk("DIDX");
+                    let data = parser.get_chunk("DATA");
+                    archive_media_index.load(didx, data);
+                    let mut bank_media_index = MediaIndex::default();
+                    bank_media_index.load(didx, data);
+                    Some(bank_media_index.entries.keys().copied().collect::<Vec<u32>>())
+                } else {
+                    None
+                };
 
                 let mut bank_misc_data = Vec::new();
                 for (tag, payload) in &parser.chunks {
@@ -292,6 +426,7 @@ impl GameArchive {
                     modified_count: 0,
                     dep,
                     hierarchy,
+                    media_index,
                 };
                 self.wwise_banks.insert(bank.id(), bank);
             } else if header.type_id == WWISE_DEP {
@@ -312,6 +447,101 @@ impl GameArchive {
                 let video = VideoSource::from_original(header.file_id, header.stream_size, stream_data[start..end].to_vec());
                 self.video_sources.insert(video.id(), video);
             }
+        }
+
+        self.resolve_audio_sources(&archive_media_index);
+    }
+
+    /// `_create_all_audio_source_objects` + `_create_audio_source*`:
+    /// resolves every `Sound` (and, once phase 3 ports it, `MusicTrack`)
+    /// source across every bank to its actual audio bytes and populates
+    /// `self.audio_sources`, keyed by `short_id` — not `AudioSource::id()`;
+    /// Python always keys this particular map by `short_id`, even for
+    /// STREAM-origin sources where `id()` would use `resource_id` instead.
+    ///
+    /// Resolution is collected into a local `Vec` and inserted in one pass
+    /// at the end rather than interleaved (as Python does, inserting into
+    /// `self.audio_sources` as each source resolves) — behaviorally
+    /// equivalent here since `seen` tracks the same dedup key
+    /// (`source.source_id`) in the same iteration order, and nothing during
+    /// resolution reads `self.audio_sources` back.
+    ///
+    /// Note: for a STREAM/PREFETCH_STREAM-origin source, Python's
+    /// `self.audio_sources[short_id]` and `wwise_streams[id].audio_source`
+    /// end up being the *same* object (aliased), so mutating one through
+    /// `audio_sources` is visible via the other. This port clones instead,
+    /// so that aliasing doesn't carry over — a real gap for whichever phase
+    /// ports `import_patch`'s audio-byte mutation if it turns out to rely on
+    /// mutating through `audio_sources` for STREAM-backed sources; harmless
+    /// for now since nothing yet mutates through this map, and BANK-type
+    /// sources (what `generate`'s DIDX/DATA loop actually reads) have no
+    /// second copy to desync from in the first place.
+    fn resolve_audio_sources(&mut self, media_index: &MediaIndex) {
+        let mut resolved: Vec<AudioSource> = Vec::new();
+        let mut seen: HashSet<u32> = HashSet::new();
+
+        for bank in self.wwise_banks.values() {
+            // MusicTrack sources join this loop once phase 3 ports MusicTrack.
+            for sound in bank.hierarchy.sounds() {
+                for source in &sound.sources {
+                    if seen.contains(&source.source_id) {
+                        continue;
+                    }
+                    if source.plugin_id != VORBIS && source.plugin_id != REV_AUDIO {
+                        continue;
+                    }
+                    let is_bank = source.stream_type as u32 == STREAM_TYPE_BANK;
+                    let is_stream = source.stream_type as u32 == STREAM_TYPE_STREAM || source.stream_type as u32 == STREAM_TYPE_PREFETCH;
+                    if !is_bank && !is_stream {
+                        continue;
+                    }
+
+                    let audio = if is_bank && source.plugin_id == REV_AUDIO {
+                        let Some(entry) = bank.hierarchy.get_entry(source.source_id) else {
+                            continue;
+                        };
+                        let Some(media_index_id) = rev_audio_media_index_id(&entry.get_data()) else {
+                            continue;
+                        };
+                        let Some(data) = media_index.data.get(&media_index_id) else {
+                            continue;
+                        };
+                        AudioSource {
+                            stream_type: STREAM_TYPE_BANK,
+                            short_id: media_index_id,
+                            data: data.clone(),
+                            ..Default::default()
+                        }
+                    } else if is_bank {
+                        let Some(data) = media_index.data.get(&source.source_id) else {
+                            continue;
+                        };
+                        AudioSource {
+                            stream_type: STREAM_TYPE_BANK,
+                            short_id: source.source_id,
+                            data: data.clone(),
+                            ..Default::default()
+                        }
+                    } else {
+                        // is_stream, regardless of plugin_id (VORBIS or REV_AUDIO) — matching Python.
+                        let dir = posix_dirname(&bank.dep.data);
+                        let stream_resource_id = murmur64_hash(format!("{dir}/{}", source.source_id).as_bytes());
+                        let Some(stream) = self.wwise_streams.get(&stream_resource_id) else {
+                            continue;
+                        };
+                        let mut audio = stream.audio_source.clone();
+                        audio.short_id = source.source_id;
+                        audio
+                    };
+
+                    seen.insert(source.source_id);
+                    resolved.push(audio);
+                }
+            }
+        }
+
+        for audio in resolved {
+            self.audio_sources.insert(audio.short_id as u64, audio);
         }
     }
 
@@ -389,7 +619,7 @@ impl GameArchive {
         }
 
         for bank in self.wwise_banks.values() {
-            let bank_data = bank.generate();
+            let bank_data = bank.generate(&self.audio_sources);
             toc_entries.push(TocHeader {
                 file_id: bank.id(),
                 type_id: WWISE_BANK,
