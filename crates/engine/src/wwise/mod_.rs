@@ -115,6 +115,20 @@ impl Mod {
         true
     }
 
+    /// True when at least one pooled resource carries the `modified` flag —
+    /// i.e. [`Self::write_patch`] would emit an archive with resources in it
+    /// rather than a bare header. Callers that consume a successful write by
+    /// deleting the inputs it merged (see
+    /// [`crate::process_audio_patches`]'s callers) check this first, so that
+    /// a mod whose audio never matched anything pooled fails loudly instead
+    /// of replacing the user's patch files with an empty one.
+    pub fn has_modified_resources(&self) -> bool {
+        self.wwise_streams.values().any(|s| s.modified)
+            || self.wwise_banks.values().any(|b| b.modified)
+            || self.text_banks.values().any(|t| t.modified)
+            || self.video_sources.values().any(|v| v.modified)
+    }
+
     /// `Mod.import_wwise_hierarchy`.
     fn import_wwise_hierarchy(&mut self, soundbank_id: u64, new_hierarchy: &crate::wwise::hierarchy::WwiseHierarchy) {
         if let Some(bank) = self.wwise_banks.get_mut(&soundbank_id) {

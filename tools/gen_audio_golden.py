@@ -62,6 +62,22 @@ def build_bank_source(version: int, source_id: int, mem_size: int, plugin_id=Non
     return src
 
 
+def build_custom_fx_entry(entry_id: int, media_index_id: int, plugin_param: bytes = b"") -> HircEntry:
+    """A generic (factory-unhandled, so it round-trips as a plain
+    `HircEntry`) custom-FX entry laid out the way
+    `_create_audio_source_type_rev_audio`/`WwiseBank.generate` read it:
+    `get_data()[13:17]` is the plugin param size and the four bytes at
+    `19 + that` are the media index id — i.e. `misc[4:8]` and
+    `misc[10 + size : 14 + size]`, since `get_data()` prefixes a 9-byte
+    type/size/id header."""
+    misc = bytearray(filler(4, seed=entry_id))
+    misc += len(plugin_param).to_bytes(4, byteorder="little")
+    misc += b"\x00\x00"
+    misc += plugin_param
+    misc += media_index_id.to_bytes(4, byteorder="little")
+    return opaque_entry(0x04, entry_id, bytes(misc))
+
+
 def build_base_param(version: int, *, num_fx: int = 0):
     """A minimal-but-valid `BaseParam`: every list/count defaults to empty
     (matching upstream's own `__init__` defaults), except
@@ -323,8 +339,15 @@ def opaque_entry(hierarchy_type: int, hierarchy_id: int, misc: bytes) -> HircEnt
     return e
 
 
-def build_hierarchy(entries) -> WwiseHierarchy_140:
-    h = WwiseHierarchy_140()
+def build_hierarchy(entries, version: int = 140):
+    """The hierarchy container must match the entries' own bank version:
+    `get_sounds()`/`get_music_tracks()` filter with `isinstance` against
+    *their own module's* `Sound`/`MusicTrack` classes, so a 140 container
+    holding 154 entries reports no sounds at all — and `WwiseBank.generate`
+    then silently emits no DIDX/DATA for those banks, leaving the encoded
+    fixture with no bank-embedded audio for `_create_all_audio_source_objects`
+    to find on the way back in."""
+    h = (h154.WwiseHierarchy_154 if version == 154 else WwiseHierarchy_140)()
     for e in entries:
         h.entries[e.hierarchy_id] = e
     return h
@@ -335,7 +358,7 @@ def build_bank(file_id: int, entries, extra_chunk=None, version: int = 140) -> "
     bank.file_id = file_id
     bkhd_body = (version ^ ac_const.BANK_VERSION_KEY).to_bytes(4, "little") + filler(24, seed=file_id)
     bank.bank_header = b"BKHD" + len(bkhd_body).to_bytes(4, "little") + bkhd_body
-    bank.hierarchy = build_hierarchy(entries)
+    bank.hierarchy = build_hierarchy(entries, version)
     dep = ac.WwiseDep()
     dep.skip = True
     dep.data = f"Bank {file_id}"
@@ -542,6 +565,31 @@ def build_cases():
     e.wwise_banks[0x8001] = v154_bank
     e.audio_sources[v154_source_id] = build_bank_audio_source(v154_source_id, v154_bytes)
     write_case("audio_sound_v154_fx_state", e)
+
+    # Case 6: two `Sound`s whose sources are both the *same* REV_AUDIO
+    # custom-FX entry — the one shape that tells `WwiseBank.generate`'s
+    # REV_AUDIO dedup apart from the VORBIS one above it. That branch tests
+    # membership on the FX entry's `source_id` but records the resolved
+    # `media_index_id` (`audio_core.py:316-320`), so the second sound emits a
+    # *second* DIDX entry and payload copy under the same media index id;
+    # keying both sides on `media_index_id` would collapse them into one.
+    fx_entry_id = 0x7001
+    rev_media_index_id = 0x7002
+    rev_bytes = filler(72, seed=40)
+
+    f = base_archive("9ba626afa44a3aa3.patch_0")
+    fx_entry = build_custom_fx_entry(fx_entry_id, rev_media_index_id, plugin_param=filler(8, seed=41))
+    rev_sound_a = build_sound(
+        154, 0xAB000001, build_bank_source(154, fx_entry_id, len(rev_bytes), plugin_id=ac_const.REV_AUDIO), build_base_param(154)
+    )
+    rev_sound_b = build_sound(
+        154, 0xAB000002, build_bank_source(154, fx_entry_id, len(rev_bytes), plugin_id=ac_const.REV_AUDIO), build_base_param(154)
+    )
+    rev_bank = build_bank(0x8002, [fx_entry, rev_sound_a, rev_sound_b], version=154)
+    rev_bank.media_index = [rev_media_index_id]
+    f.wwise_banks[0x8002] = rev_bank
+    f.audio_sources[rev_media_index_id] = build_bank_audio_source(rev_media_index_id, rev_bytes)
+    write_case("audio_rev_audio_shared_source", f)
 
     print("Done.")
 

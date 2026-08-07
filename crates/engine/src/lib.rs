@@ -311,12 +311,42 @@ pub fn process_audio_patches(dir: &Path, patches: &[PathBuf], resources: &GameRe
 
     let mut mod_ = wwise::Mod::new();
     for archive_name in &archives_to_load {
-        mod_.load_base_archive(resources.slim(), archive_name);
+        // Every name here is distinct (`archives_to_load` is a set) and
+        // `mod_` starts empty, so the only way `load_base_archive` returns
+        // false is a genuine load failure — an indexed package that's gone
+        // from disk, or one whose toc/stream data won't parse. Bail rather
+        // than merge into a pool that's missing the resources this patch
+        // targets: the callers delete the inputs a successful run consumed.
+        if !mod_.load_base_archive(resources.slim(), archive_name) {
+            return Err(format!(
+                "failed to load base game archive '{archive_name}'; cannot build a correct patch"
+            ));
+        }
     }
     for path in &sorted {
         if !mod_.import_patch(path, true) {
             return Err(format!("failed to import patch file '{}'", path.display()));
         }
+    }
+
+    // A patch group can carry audio types whose base archive this port
+    // can't resolve — `AudioIndex` maps soundbank ids only, so a group of
+    // `WWISE_STREAM`-only files (still audio per `is_audio_type_id`) loads
+    // no base archive at all, swaps nothing, and would write a
+    // resource-less patch that the callers then treat as a green light to
+    // delete the originals. Videos are the one legitimately archive-less
+    // case and they do flag `modified`, so this guard leaves them alone.
+    if !mod_.has_modified_resources() {
+        return Err(format!(
+            "no audio was replaced by {} patch file(s) (loaded base archive(s): {}); \
+             refusing to write an empty patch",
+            sorted.len(),
+            if archives_to_load.is_empty() {
+                "none".to_string()
+            } else {
+                archives_to_load.iter().cloned().collect::<Vec<_>>().join(", ")
+            }
+        ));
     }
 
     mod_.write_patch(dir, Some("9ba626afa44a3aa3.patch_0"))

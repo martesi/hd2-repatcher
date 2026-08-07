@@ -235,7 +235,15 @@ impl WwiseBank {
                         continue;
                     };
 
-                    if source.stream_type as u32 == STREAM_TYPE_BANK && !added_sources.contains(&media_index_id) {
+                    // Upstream's asymmetry, kept verbatim: this branch tests
+                    // membership on `source.source_id` (the CustomFX entry's
+                    // id) but records `media_index_id`
+                    // (`audio_core.py:316-320`), so a second entry pointing
+                    // at the same REV_AUDIO source re-emits its DIDX entry
+                    // and payload under a duplicate id. Keying both sides on
+                    // `media_index_id` would dedup it and produce a
+                    // byte-different bank.
+                    if source.stream_type as u32 == STREAM_TYPE_BANK && !added_sources.contains(&source.source_id) {
                         data_array.push(&audio.data);
                         didx_array.push(didx_entry(media_index_id, offset, audio.data.len() as u32));
                         offset += audio.data.len() as u32;
