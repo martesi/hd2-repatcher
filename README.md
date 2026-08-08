@@ -29,8 +29,6 @@ It is a single [Tauri](https://tauri.app) app with a native Rust engine:
   color persist across runs.
 - **Corruption reporting** — corrupted patch files are surfaced with a
   non-zero exit code / in-UI error instead of being silently skipped.
-- **Localized UI** — English and French, via Lingui `.po` catalogs
-  (`src/locales/`).
 
 ## Requirements
 
@@ -74,9 +72,11 @@ Once the game path is cached you can omit `-g`, and drag-and-drop one or more mo
 folders directly onto the executable. The exit code is non-zero if any corrupted
 patch files were found.
 
-On Windows the app is a windowed binary, so in CLI mode it attaches to the
-terminal it was launched from; when launched by double-click / drag-and-drop it
-opens its own console and waits for a keypress so the result stays readable.
+On Windows the app is a windowed binary with no console of its own: CLI mode
+only activates when it's launched from a terminal that already has a console
+attached. Double-click or drag-and-drop onto the executable never spawns a
+console — it always opens the GUI, with any dropped paths seeded in exactly
+as if they'd been dropped onto a running window.
 
 If you're integrating this into a mod manager, always pass the game data path
 explicitly via `-g`/`--game` on every invocation rather than relying on the
@@ -120,7 +120,7 @@ need to pay for on every `nix develop`:
 | Shell | Use it for |
 | --- | --- |
 | `nix develop` (default) | Everyday development: `tauri dev`, `cargo check`, tests. |
-| `nix develop .#e2e` | Headless GUI runs — adds Xvfb, xdotool, and ImageMagick so `tauri dev`/the built app can be driven and screenshotted without a display. See the `headless-gui` skill / `flake.nix` comments for the EGL and fontconfig gotchas this works around. |
+| `nix develop .#e2e` | Headless GUI runs — adds Xvfb, xdotool, and ImageMagick so `tauri dev`/the built app can be driven and screenshotted without a display. See the comments in `flake.nix` for the EGL and fontconfig gotchas this works around. |
 | `nix develop .#bundle` | `cargo tauri build -b deb,appimage`. An FHS environment (`buildFHSEnv`), because the AppImage bundler shells out to hardcoded `/usr/bin` paths that plain NixOS doesn't have. |
 | `nix develop .#windows` | Cross-compiling the Windows build from Linux via mingw-w64 (see [Building](#building)). |
 

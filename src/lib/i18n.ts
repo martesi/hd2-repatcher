@@ -1,6 +1,6 @@
 import { i18n } from '@lingui/core'
 
-export const locales = { en: 'English', fr: 'Français' }
+export const locales = { en: 'English' }
 export const defaultLocale = 'en'
 
 const catalogs = import.meta.glob<{ messages: Record<string, string> }>('../locales/*/messages.po')
