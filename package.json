@@ -18,7 +18,13 @@
     "check:biome": "biome format --write .",
     "check:agent": "concurrently -n ts,rs,biome \"bun run check:ts\" \"bun run check:rs\" \"bun run check:biome\"",
     "lingui:extract": "lingui extract",
-    "lingui:compile": "lingui compile"
+    "lingui:compile": "lingui compile",
+    "test:e2e:init": "bun tools/e2e.mjs init",
+    "test:e2e:baseline": "bun tools/e2e.mjs baseline",
+    "test:e2e": "bun tools/e2e.mjs test",
+    "test:e2e:install": "bun tools/e2e.mjs install",
+    "test:e2e:clean": "bun tools/e2e.mjs clean",
+    "test:e2e:unit": "bun test tools/e2e.test.mjs"
   },
   "dependencies": {
     "@lingui/core": "^6",
@@ -46,6 +52,8 @@
     "@vitejs/plugin-react": "^6",
     "babel-plugin-react-compiler": "^1",
     "concurrently": "^10.0.4",
+    "fflate": "^0.8.3",
+    "smol-toml": "^1.7.1",
     "tailwindcss": "^4",
     "typescript": "^7",
     "vite": "^8"

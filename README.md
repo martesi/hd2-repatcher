@@ -194,6 +194,25 @@ bun run dev` as above.
 cargo test -p engine    # unit tests + differential golden tests
 ```
 
+### Local e2e baseline/regression harness
+
+The ignored `r/e2e/` directory provides a repeatable local check against a
+real game install. Initialize it with a game root and either a directory of
+mod folders/ZIPs or the default `r/e2e/mods` directory:
+
+```console
+bun run test:e2e:init -- --game "/path/to/Helldivers 2" --mods /path/to/mods
+bun run test:e2e:baseline
+bun run test:e2e
+```
+
+Baselines are protected; use `bun run test:e2e:baseline -- --force` to replace
+one. A saved artifact can be explicitly installed into the configured game
+data directory with `bun run test:e2e:install -- baseline/<mod-folder>` (or a
+folder beneath `runs/`). Use `bun run test:e2e:clean` to remove runs, and add
+`--all` to remove the baseline too. The harness always invokes the CLI with
+`--no-game-path-caching` and keeps failed runs for inspection.
+
 The engine is a behaviour-preserving port of the Python `reference/` code. Its
 correctness is pinned by **differential golden tests**: `tools/gen_golden.py`
 runs the reference Python engine on synthetic patch inputs and commits the
