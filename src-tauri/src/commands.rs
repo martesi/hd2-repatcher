@@ -1,36 +1,34 @@
-//! Tauri command handlers and shared app state. The GUI talks to the native
-//! engine exclusively through these.
+//! Tauri command handlers and shared app state.
 
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use engine::{settings, GameResources, PatchKind, PatchOutcome};
-use rayon::prelude::*;
+use engine::{settings, GameResources, PatchKind};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::audio;
+use crate::patching::{self, GroupOutcome};
 
-/// The indexed game data, shared read-only across the batch worker threads.
+/// The indexed game data, shared read-only across patch operations.
 #[derive(Default)]
 pub struct AppState {
     pub resources: Mutex<Option<Arc<GameResources>>>,
-    /// Patch folder paths passed on argv at launch (double-click/drag-drop
-    /// onto the exe), consumed once by the frontend via `take_startup_paths`.
+    /// Patch paths passed on argv at launch, consumed once by the frontend.
     pub startup_paths: Mutex<Vec<String>>,
 }
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
-    pub game_data_path: Option<String>,
-    pub game_data_valid: bool,
+    pub game_root_path: Option<String>,
+    pub game_root_valid: bool,
+    pub language: Option<String>,
     pub theme: Option<String>,
     pub accent: Option<String>,
-    /// Number of indexed unit resources (0 until game data is loaded).
     pub unit_count: usize,
+    /// False while cached data is indexing or no valid index is loaded.
+    pub resources_ready: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -58,105 +56,151 @@ pub struct BatchResult {
     corrupted: Vec<String>,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GameDataPatchResult {
+    pub main: String,
+    pub kind: String,
+}
+
 fn current_unit_count(app: &AppHandle) -> usize {
     app.state::<AppState>()
         .resources
         .lock()
         .unwrap()
         .as_ref()
-        .map(|r| r.unit_count())
+        .map(|resources| resources.unit_count())
         .unwrap_or(0)
 }
 
 #[tauri::command]
 pub fn get_config(app: AppHandle) -> Config {
-    let s = settings::load();
-    let game_data_valid = s
-        .game_data_path
+    let settings = settings::load();
+    let language = settings.language.filter(|language| language == "en");
+    let game_root_valid = settings
+        .game_root
         .as_ref()
-        .map(|p| engine::is_valid_game_data_path(Path::new(p)))
+        .map(|path| engine::is_valid_game_root_path(Path::new(path)))
         .unwrap_or(false);
+    let resources_ready = app
+        .state::<AppState>()
+        .resources
+        .lock()
+        .unwrap()
+        .is_some();
     Config {
-        game_data_path: s.game_data_path,
-        game_data_valid,
-        theme: s.theme,
-        accent: s.accent,
+        game_root_path: settings.game_root,
+        game_root_valid,
+        language,
+        theme: settings.theme,
+        accent: settings.accent,
         unit_count: current_unit_count(&app),
+        resources_ready,
     }
 }
 
-/// Validates and persists the game data path. Returns whether it is valid; the
-/// caller should follow up with `init_game_resources` to index it.
+/// Validates and persists the install root. Changing it invalidates the
+/// current index before the frontend starts a new indexing operation.
 #[tauri::command]
-pub fn set_game_path(path: String) -> Result<bool, String> {
-    let valid = engine::is_valid_game_data_path(Path::new(&path));
-    let mut s = settings::load();
-    s.game_data_path = Some(path);
-    settings::save(&s).map_err(|e| e.to_string())?;
+pub fn set_game_root(app: AppHandle, path: String) -> Result<bool, String> {
+    let valid = engine::is_valid_game_root_path(Path::new(&path));
+    let mut settings = settings::load();
+    settings.game_root = Some(path);
+    settings::save(&settings).map_err(|error| error.to_string())?;
+    *app.state::<AppState>().resources.lock().unwrap() = None;
     Ok(valid)
 }
 
 #[tauri::command]
+pub fn set_language(language: String) -> Result<(), String> {
+    if language != "en" {
+        return Err(format!("Unsupported language: {language}"));
+    }
+    let mut settings = settings::load();
+    settings.language = Some(language);
+    settings::save(&settings).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub fn set_theme(theme: String) -> Result<(), String> {
-    let mut s = settings::load();
-    s.theme = Some(theme);
-    settings::save(&s).map_err(|e| e.to_string())
+    let mut settings = settings::load();
+    settings.theme = Some(theme);
+    settings::save(&settings).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub fn set_accent(accent: String) -> Result<(), String> {
-    let mut s = settings::load();
-    s.accent = Some(accent);
-    settings::save(&s).map_err(|e| e.to_string())
+    let mut settings = settings::load();
+    settings.accent = Some(accent);
+    settings::save(&settings).map_err(|error| error.to_string())
 }
 
-/// Indexes the game data at `path` (heavy; runs off the async runtime) and
-/// stores it in app state. Returns the number of indexed unit resources.
+/// Indexes the derived game data at `game_root` off the async runtime.
 #[tauri::command]
-pub async fn init_game_resources(app: AppHandle, path: String) -> Result<usize, String> {
-    let p = PathBuf::from(&path);
-    if !engine::is_valid_game_data_path(&p) {
-        return Err("Not a valid Helldivers II data folder".into());
+pub async fn init_game_resources(app: AppHandle, game_root: String) -> Result<usize, String> {
+    let root = PathBuf::from(&game_root);
+    if !engine::is_valid_game_root_path(&root) {
+        return Err("Not a valid Helldivers II install root".into());
     }
-    let resources = tauri::async_runtime::spawn_blocking(move || GameResources::load(&p))
+    *app.state::<AppState>().resources.lock().unwrap() = None;
+    let data = engine::game_data_path(&root);
+    let resources = tauri::async_runtime::spawn_blocking(move || GameResources::load(&data))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
+    // Do not install an index that finished after the user selected a new
+    // install root.
+    let configured = settings::load().game_root;
+    if configured.as_deref() != Some(&game_root) {
+        return Err("Game install root changed while indexing".into());
+    }
     let count = resources.unit_count();
     *app.state::<AppState>().resources.lock().unwrap() = Some(Arc::new(resources));
     Ok(count)
 }
 
-/// Repatches every patch file under `path`, emitting `batch://progress` events
-/// as it goes. Auto-run when a folder is dropped/added on the Home page.
-#[tauri::command]
-pub async fn process_batch(app: AppHandle, id: String, path: String) -> Result<BatchResult, String> {
-    let resources = app
-        .state::<AppState>()
+fn patch_resources(app: &AppHandle) -> Result<Arc<GameResources>, String> {
+    let settings = settings::load();
+    let root = settings
+        .game_root
+        .ok_or("Game install root is not set. Set it in Settings first.")?;
+    if !engine::is_valid_game_root_path(Path::new(&root)) {
+        return Err("Configured Helldivers II install root is invalid".into());
+    }
+    app.state::<AppState>()
         .resources
         .lock()
         .unwrap()
         .clone()
-        .ok_or("Game data path is not set. Set it in Settings first.")?;
+        .ok_or_else(|| "Game resources are still indexing. Please wait and try again.".into())
+}
 
+/// Repatches one selected patch group or every group under a selected folder.
+#[tauri::command]
+pub async fn process_batch(app: AppHandle, id: String, path: String) -> Result<BatchResult, String> {
+    let resources = patch_resources(&app)?;
     let handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || run_batch(handle, id, path, resources))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|error| error.to_string())
 }
 
-fn emit_progress(app: &AppHandle, p: &BatchProgress) {
-    let _ = app.emit("batch://progress", p);
+fn emit_progress(app: &AppHandle, progress: &BatchProgress) {
+    let _ = app.emit("batch://progress", progress);
 }
 
 fn run_batch(app: AppHandle, id: String, path: String, resources: Arc<GameResources>) -> BatchResult {
-    let dir = PathBuf::from(&path);
-    let patches = engine::find_patch_files(&dir);
-    let patches_found = patches.len();
-
-    let checked = AtomicUsize::new(0);
-    let updated = AtomicUsize::new(0);
-    let skipped = AtomicUsize::new(0);
-    let corrupted = Mutex::new(Vec::<String>::new());
+    let input = PathBuf::from(&path);
+    let candidates = if input.is_dir() {
+        engine::find_patch_files(&input)
+    } else {
+        vec![input.clone()]
+    };
+    let patches_found = candidates.len();
+    let mut checked = 0usize;
+    let mut updated = 0usize;
+    let mut skipped = 0usize;
+    let mut audio = 0usize;
+    let mut corrupted = Vec::<String>::new();
 
     emit_progress(
         &app,
@@ -172,74 +216,55 @@ fn run_batch(app: AppHandle, id: String, path: String, resources: Arc<GameResour
         },
     );
 
-    patches.par_iter().for_each(|p| {
-        // A file carrying audio resources is merged natively in the pass
-        // below, not counted as "skipped" here even if it has no unit data.
-        let is_audio = matches!(
-            engine::classify_patch_file(p),
-            PatchKind::Audio | PatchKind::UnitAndAudio
-        );
-        // A malformed patch must not take down the GUI; treat a panic as corrupt.
+    for candidate in candidates {
+        let group = match engine::PatchFileGroup::resolve(&candidate) {
+            Ok(group) => group,
+            Err(error) => {
+                corrupted.push(format!("{}: {error}", candidate.display()));
+                checked += 1;
+                emit_batch_progress(
+                    &app,
+                    &id,
+                    patches_found,
+                    checked,
+                    updated,
+                    skipped,
+                    audio,
+                    &corrupted,
+                );
+                continue;
+            }
+        };
         let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            engine::update_patch_file(p, &*resources)
+            patching::process_patch_group(&group, &resources)
         }))
-        .unwrap_or(PatchOutcome::Corrupted);
+        .unwrap_or_else(|_| Err("patching panicked while processing a malformed group".into()));
 
         match outcome {
-            PatchOutcome::Updated => {
-                updated.fetch_add(1, Ordering::Relaxed);
-            }
-            PatchOutcome::NoUnits => {
-                if !is_audio {
-                    skipped.fetch_add(1, Ordering::Relaxed);
+            Ok(GroupOutcome::Updated(kind)) => {
+                if matches!(kind, PatchKind::Unit | PatchKind::UnitAndAudio) {
+                    updated += 1;
+                }
+                if matches!(kind, PatchKind::Audio | PatchKind::UnitAndAudio) {
+                    audio += 1;
                 }
             }
-            PatchOutcome::Corrupted => {
-                corrupted.lock().unwrap().push(p.to_string_lossy().into_owned());
-            }
+            Ok(GroupOutcome::Skipped(_)) => skipped += 1,
+            Err(error) => corrupted.push(format!("{}: {error}", group.main.display())),
         }
-        let done = checked.fetch_add(1, Ordering::Relaxed) + 1;
-        emit_progress(
+        checked += 1;
+        emit_batch_progress(
             &app,
-            &BatchProgress {
-                id: id.clone(),
-                status: "running".into(),
-                patches_found,
-                checked: done,
-                updated: updated.load(Ordering::Relaxed),
-                skipped: skipped.load(Ordering::Relaxed),
-                audio: 0,
-                corrupted: corrupted.lock().unwrap().clone(),
-            },
+            &id,
+            patches_found,
+            checked,
+            updated,
+            skipped,
+            audio,
+            &corrupted,
         );
-    });
-
-    // Natively merge every directory that directly holds audio patches into
-    // the game data, mirroring the CLI's second pass.
-    let mut audio_updated = 0usize;
-    for (adir, apatches) in engine::find_audio_dirs(&dir) {
-        // A malformed/incomplete mod must not take down the GUI; treat a
-        // panic as a failure for this directory, matching the per-file
-        // handling above.
-        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            engine::process_audio_patches(&adir, &apatches, &resources)
-        }))
-        .unwrap_or_else(|_| Err("panicked while processing (malformed or incomplete mod?)".to_string()));
-        match outcome {
-            Ok(()) => {
-                let stale: Vec<PathBuf> = apatches
-                    .iter()
-                    .filter(|p| p.file_name().is_none_or(|n| n != "9ba626afa44a3aa3.patch_0"))
-                    .cloned()
-                    .collect();
-                audio::remove_stale_audio_files(&stale);
-                audio_updated += apatches.len();
-            }
-            Err(e) => corrupted.lock().unwrap().push(e),
-        }
     }
 
-    let corrupted = corrupted.into_inner().unwrap();
     let status = if corrupted.is_empty() { "done" } else { "error" };
     emit_progress(
         &app,
@@ -247,10 +272,10 @@ fn run_batch(app: AppHandle, id: String, path: String, resources: Arc<GameResour
             id: id.clone(),
             status: status.into(),
             patches_found,
-            checked: patches_found,
-            updated: updated.load(Ordering::Relaxed),
-            skipped: skipped.load(Ordering::Relaxed),
-            audio: audio_updated,
+            checked,
+            updated,
+            skipped,
+            audio,
             corrupted: corrupted.clone(),
         },
     );
@@ -259,35 +284,114 @@ fn run_batch(app: AppHandle, id: String, path: String, resources: Arc<GameResour
         id,
         path,
         patches_found,
-        updated: updated.load(Ordering::Relaxed),
-        skipped: skipped.load(Ordering::Relaxed),
-        audio: audio_updated,
+        updated,
+        skipped,
+        audio,
         corrupted,
     }
 }
 
-/// Returns and clears the patch folder paths seeded at launch (double-click or
-/// drag-drop onto the exe). Called once by the frontend on mount.
+fn emit_batch_progress(
+    app: &AppHandle,
+    id: &str,
+    patches_found: usize,
+    checked: usize,
+    updated: usize,
+    skipped: usize,
+    audio: usize,
+    corrupted: &[String],
+) {
+    emit_progress(
+        app,
+        &BatchProgress {
+            id: id.to_owned(),
+            status: "running".into(),
+            patches_found,
+            checked,
+            updated,
+            skipped,
+            audio,
+            corrupted: corrupted.to_vec(),
+        },
+    );
+}
+
+/// Patches exactly one group selected from the configured game `data` folder.
+/// Mod-manager users should patch the mod source through their manager instead.
+#[tauri::command]
+pub async fn patch_game_data(
+    app: AppHandle,
+    path: String,
+) -> Result<GameDataPatchResult, String> {
+    let resources = patch_resources(&app)?;
+    let settings = settings::load();
+    let root = settings
+        .game_root
+        .ok_or("Game install root is not set. Set it in Settings first.")?;
+    let data = engine::game_data_path(Path::new(&root));
+    let group = engine::PatchFileGroup::resolve(Path::new(&path)).map_err(|error| error.to_string())?;
+    let data_canonical = std::fs::canonicalize(&data)
+        .map_err(|error| format!("failed to resolve configured game data directory: {error}"))?;
+    let main_canonical = std::fs::canonicalize(&group.main)
+        .map_err(|error| format!("failed to resolve selected patch group: {error}"))?;
+    if main_canonical.parent() != Some(data_canonical.as_path()) {
+        return Err(format!(
+            "selected patch group must be directly inside the configured game data directory ({})",
+            data.display()
+        ));
+    }
+
+    let kind = engine::classify_patch_file(&group.main);
+    if kind == PatchKind::Corrupted {
+        return Err(format!("patch '{}' is malformed", group.main.display()));
+    }
+    let main = group.main.to_string_lossy().into_owned();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        patching::process_patch_group(&group, &resources)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    if matches!(result, GroupOutcome::Skipped(_)) {
+        return Err(format!("selected patch '{}' has no unit or audio resources", main));
+    }
+    Ok(GameDataPatchResult {
+        main,
+        kind: format_patch_kind(kind),
+    })
+}
+
+fn format_patch_kind(kind: PatchKind) -> String {
+    match kind {
+        PatchKind::Unit => "unit",
+        PatchKind::Audio => "audio",
+        PatchKind::UnitAndAudio => "unit-and-audio",
+        PatchKind::Other => "other",
+        PatchKind::Corrupted => "corrupted",
+    }
+    .into()
+}
+
+/// Returns and clears paths seeded at launch (double-click or drag-drop onto
+/// the executable).
 #[tauri::command]
 pub fn take_startup_paths(app: AppHandle) -> Vec<String> {
     std::mem::take(&mut *app.state::<AppState>().startup_paths.lock().unwrap())
 }
 
-/// Loads the cached game data path (if valid) into state at startup so batches
-/// work immediately. Emits `resources://ready` with the unit count on success.
+/// Loads the cached install root at startup so patch controls become available
+/// only after indexing has completed.
 pub fn preload_cached_resources(app: &AppHandle) {
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        let Some(path) = settings::load().game_data_path else {
+        let Some(path) = settings::load().game_root else {
             return;
         };
-        let p = PathBuf::from(&path);
-        if !engine::is_valid_game_data_path(&p) {
+        let root = PathBuf::from(&path);
+        if !engine::is_valid_game_root_path(&root) {
             return;
         }
-        if let Ok(resources) =
-            tauri::async_runtime::spawn_blocking(move || GameResources::load(&p)).await
-        {
+        let data = engine::game_data_path(&root);
+        if let Ok(resources) = tauri::async_runtime::spawn_blocking(move || GameResources::load(&data)).await {
             let count = resources.unit_count();
             *handle.state::<AppState>().resources.lock().unwrap() = Some(Arc::new(resources));
             let _ = handle.emit("resources://ready", count);

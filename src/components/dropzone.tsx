@@ -1,7 +1,7 @@
 import { Trans } from '@lingui/react/macro'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { useEffect, useState } from 'react'
-import { pickFolder } from '@/lib/tauri'
+import { pickFolder, pickPatchPath } from '@/lib/tauri'
 import { cn } from '@/lib/utils'
 import { FolderPlusIcon } from './icons'
 import { Button } from './ui/button'
@@ -33,8 +33,13 @@ export function Dropzone({
     return () => unlisten?.()
   }, [onAdd, disabled])
 
-  async function addViaPicker() {
+  async function addFolderViaPicker() {
     const path = await pickFolder('Select a mod folder to repatch')
+    if (path) onAdd(path)
+  }
+
+  async function addPatchViaPicker() {
+    const path = await pickPatchPath('Select a patch file or companion to repatch')
     if (path) onAdd(path)
   }
 
@@ -48,11 +53,16 @@ export function Dropzone({
     >
       <FolderPlusIcon className="text-muted-foreground" width={30} height={30} />
       <div className="text-sm text-muted-foreground">
-        <Trans>Drag a mod folder here, or</Trans>
+        <Trans>Drag a mod folder or patch file here, or choose one</Trans>
       </div>
-      <Button onClick={addViaPicker} disabled={disabled}>
-        <Trans>Add folder</Trans>
-      </Button>
+      <div className="flex gap-2">
+        <Button onClick={addFolderViaPicker} disabled={disabled}>
+          <Trans>Add folder</Trans>
+        </Button>
+        <Button variant="outline" onClick={addPatchViaPicker} disabled={disabled}>
+          <Trans>Add patch</Trans>
+        </Button>
+      </div>
     </div>
   )
 }

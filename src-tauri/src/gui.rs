@@ -8,7 +8,7 @@ use tauri::{Emitter, Manager};
 
 use crate::commands::{self, AppState};
 
-/// `cli_paths` are patch folders dropped onto the exe at launch (empty for a
+/// `cli_paths` are patch files, companions, or folders dropped onto the exe at launch (empty for a
 /// plain GUI open). They're stashed in state and pulled once by the frontend
 /// via `take_startup_paths` rather than emitted directly, since the frontend
 /// isn't listening yet this early in the window's lifecycle.
@@ -34,18 +34,20 @@ pub fn run(cli_paths: Vec<String>) {
             ..Default::default()
         })
         .setup(|app| {
-            // Index the cached game data path (if any) up front so dropped
-            // batches can run immediately.
+            // Index the cached game install root (if any) up front so dropped
+            // patch paths can run immediately after indexing.
             commands::preload_cached_resources(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
-            commands::set_game_path,
+            commands::set_game_root,
+            commands::set_language,
             commands::set_theme,
             commands::set_accent,
             commands::init_game_resources,
             commands::process_batch,
+            commands::patch_game_data,
             commands::take_startup_paths,
         ])
         .run(tauri::generate_context!())

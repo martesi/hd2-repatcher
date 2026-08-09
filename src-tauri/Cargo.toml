@@ -3,7 +3,7 @@ name = "hd2-repatcher"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Repatches Helldivers II unit mods after a game update (GUI + CLI)"
+description = "Repatches Helldivers II unit and audio mods after a game update (GUI + CLI)"
 default-run = "hd2-repatcher"
 
 [[bin]]
@@ -20,7 +20,6 @@ tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
-rayon = { workspace = true }
 engine = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 

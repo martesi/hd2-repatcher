@@ -117,11 +117,9 @@ impl Mod {
 
     /// True when at least one pooled resource carries the `modified` flag —
     /// i.e. [`Self::write_patch`] would emit an archive with resources in it
-    /// rather than a bare header. Callers that consume a successful write by
-    /// deleting the inputs it merged (see
-    /// [`crate::process_audio_patches`]'s callers) check this first, so that
-    /// a mod whose audio never matched anything pooled fails loudly instead
-    /// of replacing the user's patch files with an empty one.
+    /// rather than a bare header. The transactional patching layer checks this
+    /// first so a mod whose audio never matched anything pooled fails loudly
+    /// instead of staging an empty patch.
     pub fn has_modified_resources(&self) -> bool {
         self.wwise_streams.values().any(|s| s.modified)
             || self.wwise_banks.values().any(|b| b.modified)

@@ -1,238 +1,185 @@
-//! Headless CLI mode — a faithful port of `reference/cli.py`. Runs when the
-//! binary is launched with arguments; the GUI is never created in this path.
+//! Headless CLI mode. Every input is processed as either one selected patch
+//! group or all groups beneath a selected directory; no neighbouring group is
+//! merged, renamed, or removed.
 
-use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use engine::{settings, GameResources, PatchResult};
+use engine::{settings, GameResources, PatchKind};
 
-use crate::audio;
+use crate::patching::{self, GroupOutcome};
 
 pub mod console;
-
-/// Filename `engine::process_audio_patches` always writes its merged output
-/// as. Excluded from stale-file cleanup so a per-mod input that happens to
-/// already have this exact name isn't deleted out from under its own output.
-const MERGED_AUDIO_PATCH_NAME: &str = "9ba626afa44a3aa3.patch_0";
 
 #[derive(Parser, Debug)]
 #[command(
     name = "hd2-repatcher",
-    about = "Update unit resources in Helldivers II patch files.",
+    about = "Repatch Helldivers II unit and audio patch groups in place.",
     disable_help_subcommand = true
 )]
 pub struct Args {
-    /// path to the Helldivers II game data folder; also cached for future runs
+    /// path to the Helldivers II install root; its `data` folder is used and cached for future runs
     #[arg(short = 'g', long = "game", value_name = "PATH")]
     pub game: Option<String>,
 
-    /// do not save or overwrite the cached game data path
+    /// do not save or overwrite the cached game install root
     #[arg(long = "no-game-path-caching")]
     pub no_game_path_caching: bool,
 
-    /// write repatched copies into DIR (one <name> subfolder per input folder)
-    /// instead of modifying the originals in place
-    #[arg(short = 'o', long = "output", value_name = "DIR")]
-    pub output: Option<String>,
-
-    /// operate on a copy, leaving the original mod files untouched; copies land
-    /// in --output, or in a sibling `<name>-repatched/` folder when omitted
-    #[arg(short = 'n', long = "dry-run")]
-    pub dry_run: bool,
-
-    /// folder(s) containing patch files to update
-    #[arg(value_name = "PATCH_FOLDER")]
+    /// patch file, companion file, or folder(s) containing patch groups
+    #[arg(value_name = "PATCH_PATH")]
     pub patches: Vec<String>,
 }
 
-fn absolute(p: &str) -> PathBuf {
-    std::path::absolute(p).unwrap_or_else(|_| PathBuf::from(p))
+fn absolute(path: &str) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| PathBuf::from(path))
 }
 
-/// Runs the CLI and returns the process exit code (non-zero if any corrupted
-/// or audio patch files failed to process, or an argument was invalid).
+/// Runs the CLI and returns a non-zero exit code if any input group failed or
+/// the configured game path was invalid.
 pub fn run(args: Args) -> i32 {
-    let mut game_path: Option<PathBuf> = None;
-    if let Some(g) = &args.game {
-        let p = absolute(g);
-        if !engine::is_valid_game_data_path(&p) {
+    let mut game_root = None;
+    if let Some(game) = &args.game {
+        let path = absolute(game);
+        if !engine::is_valid_game_root_path(&path) {
             eprintln!(
-                "error: '{}' does not look like a Helldivers II data folder \
-                 (expected to find `{}` or `{}` inside it)",
-                g,
+                "error: '{}' does not look like a Helldivers II install root \
+                 (expected to find a `data` folder containing `{}` or `{}`)",
+                game,
                 engine::LEGACY_MARKER_FILE,
                 engine::SLIM_MARKER_FILE
             );
             return 1;
         }
         if !args.no_game_path_caching {
-            let _ = settings::set_cached_game_data_path(&p.to_string_lossy());
+            let _ = settings::set_cached_game_root(&path.to_string_lossy());
         }
-        println!("Game data directory set to: {}", p.display());
-        game_path = Some(p);
+        println!("Game install root set to: {}", path.display());
+        game_root = Some(path);
     }
 
-    run_cli(game_path, &args)
+    run_cli(game_root, &args)
 }
 
-fn run_cli(game_path: Option<PathBuf>, args: &Args) -> i32 {
-    let game_path = match game_path {
-        Some(p) => p,
-        None => match settings::get_cached_game_data_path() {
-            Some(c) if engine::is_valid_game_data_path(Path::new(&c)) => PathBuf::from(c),
+#[derive(Default)]
+struct CliSummary {
+    patches_found: usize,
+    updated: Vec<String>,
+    audio_updated: Vec<String>,
+    no_units: Vec<String>,
+    corrupted: Vec<String>,
+}
+
+fn run_cli(game_root: Option<PathBuf>, args: &Args) -> i32 {
+    let game_root = match game_root {
+        Some(path) => path,
+        None => match settings::get_cached_game_root() {
+            Some(cached) if engine::is_valid_game_root_path(Path::new(&cached)) => {
+                PathBuf::from(cached)
+            }
             _ => {
-                eprintln!("error: no game data directory configured; pass -g/--game <path>");
+                eprintln!("error: no game install root configured; pass -g/--game <path>");
                 return 1;
             }
         },
     };
 
-    println!("Loading game resources from: {}", game_path.display());
-    let resources = GameResources::load(&game_path);
+    // Recheck immediately before loading and patching. This guards cached
+    // paths that became invalid after the argument parse and ensures no patch
+    // mutation begins with an invalid game install.
+    if !engine::is_valid_game_root_path(&game_root) {
+        eprintln!("error: configured Helldivers II install root is no longer valid");
+        return 1;
+    }
+    let game_data = engine::game_data_path(&game_root);
+    println!("Loading game resources from: {}", game_data.display());
+    let resources = GameResources::load(&game_data);
 
     let mut exit_code = 0;
-    for patch_dir in &args.patches {
-        let src = absolute(patch_dir);
-        if !src.is_dir() {
-            eprintln!("error: '{}' is not a directory", src.display());
-            exit_code = 1;
-            continue;
-        }
-
-        // Dry-run / -o operate on a copy so the originals are never touched.
-        let copy = args.dry_run || args.output.is_some();
-        let work_dir = if copy {
-            let dest = output_dest(&src, args.output.as_deref());
-            if dest == src {
-                eprintln!("error: output destination for '{}' resolves to itself", src.display());
-                exit_code = 1;
-                continue;
+    for input in &args.patches {
+        let source = absolute(input);
+        let mut summary = CliSummary::default();
+        if source.is_dir() {
+            let candidates = engine::find_patch_files(&source);
+            summary.patches_found = candidates.len();
+            for candidate in candidates {
+                process_candidate(&candidate, &resources, &mut summary);
             }
-            let _ = std::fs::remove_dir_all(&dest);
-            if let Err(e) = audio::copy_dir_recursive(&src, &dest) {
-                eprintln!("error: {e}");
-                exit_code = 1;
-                continue;
-            }
-            dest
         } else {
-            src.clone()
-        };
-
-        // 1. Unit patching on the working dir (also classifies audio-carrying
-        // files into `result.audio`, but doesn't merge them).
-        let mut result = engine::process_patch_folder(&work_dir, &resources);
-        if !result.corrupted_files.is_empty() {
-            exit_code = 1;
+            summary.patches_found = 1;
+            process_candidate(&source, &resources, &mut summary);
         }
 
-        // 2. Natively merge each directory that directly holds audio patches.
-        if !merge_audio_dirs(&work_dir, &resources, &mut result) {
+        if !summary.corrupted.is_empty() {
             exit_code = 1;
         }
-
-        let dest = copy.then(|| work_dir.clone());
-        print_cli_result(&src, dest.as_deref(), &result);
+        print_cli_result(&source, &summary);
     }
     exit_code
 }
 
-/// Merges every audio-patch directory under `work_dir` via
-/// `engine::process_audio_patches`, filling `result.audio_updated`/
-/// `audio_failed`. Returns `false` if any group failed.
-fn merge_audio_dirs(work_dir: &Path, resources: &GameResources, result: &mut PatchResult) -> bool {
-    let mut ok = true;
-    for (dir, patches) in engine::find_audio_dirs(work_dir) {
-        // A malformed/incomplete mod (e.g. a `.patch_N` missing its required
-        // `.stream` companion) must not take down the whole run; treat a
-        // panic as a per-directory failure, matching how a corrupt unit
-        // patch is handled.
-        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            engine::process_audio_patches(&dir, &patches, resources)
-        }))
-        .unwrap_or_else(|_| Err("panicked while processing (malformed or incomplete mod?)".to_string()));
-        match outcome {
-            Ok(()) => {
-                let stale: Vec<PathBuf> = patches
-                    .iter()
-                    .filter(|p| p.file_name().is_none_or(|n| n != MERGED_AUDIO_PATCH_NAME))
-                    .cloned()
-                    .collect();
-                audio::remove_stale_audio_files(&stale);
-                result
-                    .audio_updated
-                    .extend(patches.iter().map(|p| p.to_string_lossy().into_owned()));
-            }
-            Err(e) => {
-                ok = false;
-                for p in &patches {
-                    result
-                        .audio_failed
-                        .push((p.to_string_lossy().into_owned(), e.clone()));
-                }
-            }
+fn process_candidate(path: &Path, resources: &GameResources, summary: &mut CliSummary) {
+    let group = match engine::PatchFileGroup::resolve(path) {
+        Ok(group) => group,
+        Err(error) => {
+            summary
+                .corrupted
+                .push(format!("{}: {error}", path.display()));
+            return;
         }
-    }
-    ok
-}
+    };
 
-/// Computes the copy destination for a mod folder: `<output>/<name>` when
-/// `--output` is given, otherwise a sibling `<name>-repatched/`.
-fn output_dest(src: &Path, output: Option<&str>) -> PathBuf {
-    let name = src.file_name().unwrap_or_default();
-    match output {
-        Some(o) => absolute(o).join(name),
-        None => {
-            let mut fname = name.to_os_string();
-            fname.push("-repatched");
-            src.parent().unwrap_or_else(|| Path::new(".")).join(fname)
+    match patching::process_patch_group(&group, resources) {
+        Ok(GroupOutcome::Updated(kind)) => {
+            let name = group.main.to_string_lossy().into_owned();
+            if matches!(kind, PatchKind::Unit | PatchKind::UnitAndAudio) {
+                summary.updated.push(name.clone());
+            }
+            if matches!(kind, PatchKind::Audio | PatchKind::UnitAndAudio) {
+                summary.audio_updated.push(name);
+            }
         }
+        Ok(GroupOutcome::Skipped(_)) => {
+            summary
+                .no_units
+                .push(group.main.to_string_lossy().into_owned());
+        }
+        Err(error) => summary
+            .corrupted
+            .push(format!("{}: {error}", group.main.display())),
     }
 }
 
-fn print_cli_result(directory: &Path, dest: Option<&Path>, result: &PatchResult) {
-    println!("\n{}", directory.display());
-    if let Some(dest) = dest {
-        println!("  Repatched copy written to: {}", dest.display());
-    }
-    if result.patches_found == 0 {
+fn print_cli_result(source: &Path, summary: &CliSummary) {
+    println!("\n{}", source.display());
+    if summary.patches_found == 0 {
         println!("  No patch files found.");
         return;
     }
-    println!("  Checked {} patch file(s)", result.patches_found);
+    println!("  Checked {} patch group(s)", summary.patches_found);
     println!(
-        "  Updated {} patch file(s) containing unit resources",
-        result.updated.len()
+        "  Updated {} patch group(s) containing unit resources",
+        summary.updated.len()
     );
-    if !result.audio_updated.is_empty() {
+    if !summary.audio_updated.is_empty() {
         println!(
-            "  Patched {} audio patch file(s)",
-            result.audio_updated.len()
+            "  Patched {} audio patch group(s)",
+            summary.audio_updated.len()
         );
     }
-    if !result.audio_failed.is_empty() {
-        eprintln!(
-            "  Failed to patch {} audio patch file(s):",
-            result.audio_failed.len()
-        );
-        for (name, err) in &result.audio_failed {
-            eprintln!("    {name}: {err}");
-        }
-    }
-    if !result.no_units.is_empty() {
+    if !summary.no_units.is_empty() {
         println!(
-            "  Skipped {} patch file(s) with no unit resources",
-            result.no_units.len()
+            "  Skipped {} patch group(s) with no unit or audio resources",
+            summary.no_units.len()
         );
     }
-    if !result.corrupted_files.is_empty() {
+    if !summary.corrupted.is_empty() {
         eprintln!(
-            "  Found {} corrupted patch file(s):",
-            result.corrupted_files.len()
+            "  Failed to patch {} group(s):",
+            summary.corrupted.len()
         );
-        for name in &result.corrupted_files {
-            eprintln!("    {}", name);
+        for name in &summary.corrupted {
+            eprintln!("    {name}");
         }
     }
 }

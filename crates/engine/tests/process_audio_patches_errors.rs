@@ -2,13 +2,10 @@
 //! `process_audio_patches`'s refusal paths. The first mirrors real upstream
 //! `run_patch_cli`'s `"Unable to locate base archive for soundbank ..."`
 //! early return (`hd2-audio-modder/audio_modder.py:3712-3721`); the other
-//! two are this port's own, and exist because its callers treat a successful
-//! return as licence to delete the `.patch_N` files (and `.stream`/
-//! `.gpu_resources` companions) they just merged — and `write_patch` can
-//! overwrite one of those very inputs, since the merged output reuses the
-//! `9ba626afa44a3aa3.patch_0` name. Writing a resource-less patch must
-//! therefore be an error, never a silent success. All three reuse existing
-//! golden-fixture archives rather than hand-building ones.
+//! two are this port's own, and ensure an audio run that replaces nothing
+//! cannot stage or commit a resource-less patch over the selected group.
+//! All three reuse existing golden-fixture archives rather than hand-building
+//! ones.
 
 use std::path::{Path, PathBuf};
 

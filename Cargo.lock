@@ -991,6 +991,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "toml 0.8.2",
 ]
 
 [[package]]
@@ -1543,7 +1544,6 @@ version = "0.4.0"
 dependencies = [
  "clap",
  "engine",
- "rayon",
  "serde",
  "serde_json",
  "tauri",

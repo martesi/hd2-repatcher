@@ -1,11 +1,11 @@
 # HD2 Repatcher
 
-Repatches Helldivers II unit mods after a game update.
+Repatches Helldivers II unit and audio mods after a game update.
 
-When Helldivers II updates, unit mod `.patch` files can go out of sync with the
-game's unit data, causing them to fail to load. This tool scans a folder of
-patch files, finds the ones containing unit resources, and updates those
-resources in place using the current game data.
+When Helldivers II updates, unit and audio mod `.patch_N` files can go out of
+sync with the game's resources, causing them to fail to load. This tool updates
+one patch group at a time in place, preserving each main filename and its
+optional `.stream` and `.gpu_resources` companions.
 
 It is a single [Tauri](https://tauri.app) app with a native Rust engine:
 
@@ -16,23 +16,25 @@ It is a single [Tauri](https://tauri.app) app with a native Rust engine:
 
 ## Features
 
-- **Batch repatching** — drop any number of mod folders at once; each becomes
-  its own batch with live per-file progress.
+- **Batch repatching** — drop mod folders or individual patch files at once;
+  folders are processed one patch group at a time with live progress.
 - **GUI or headless CLI** from the same binary, so it works both as a
   point-and-click tool and as a step in a mod manager's pipeline.
 - **Native Rust engine** — a behaviour-preserving, byte-exact port of the
-  original Python tool, pinned by differential golden tests (see
+  original Python unit and audio tools, pinned by differential golden tests (see
   [Testing](#testing)).
 - **Cross-platform** — prebuilt Windows and Linux installers, no runtime
   dependencies.
-- **Remembers your setup** — the Helldivers II data path, theme, and accent
+- **Remembers your setup** — the Helldivers II install root, language, theme, and accent
   color persist across runs.
-- **Corruption reporting** — corrupted patch files are surfaced with a
+- **In-place safety** — work is staged and validated before only the selected
+  group is replaced; unrelated files and existing companions are preserved.
+- **Corruption reporting** — corrupted patch groups are surfaced with a
   non-zero exit code / in-UI error instead of being silently skipped.
 
 ## Requirements
 
-- A Helldivers II install (specifically its `data` folder).
+- A Helldivers II install. The app derives and uses its `data` folder.
 - Windows or Linux. Prebuilt installers are attached to each
   [Release](../../releases); no runtime dependencies.
 
@@ -45,32 +47,39 @@ It is a single [Tauri](https://tauri.app) app with a native Rust engine:
 2. Run it. No other dependencies are required — the Tauri webview uses the
    system's own WebView2 (Windows) or WebKitGTK (Linux, pulled in by the
    `.deb`/`.AppImage`).
-3. Launch `hd2-repatcher` and point it at your Helldivers II `data` folder in
-   **Settings** (or pass `-g`/`--game` on the CLI) the first time you use it.
+3. Launch `hd2-repatcher` and follow the setup wizard to choose your
+   Helldivers II install root and language. You can change these later in
+   **Settings** (or pass `-g`/`--game` on the CLI).
 
 ## Usage
 
 ### GUI
 
 Launch with no arguments (double-click, or `hd2-repatcher`). The **Home** page
-lets you drop or add mod folders; each folder becomes a batch that repatches
-immediately with live progress. The **Settings** page holds the Helldivers II
-`data` folder (cached for future runs) and theme / accent color.
+lets you drop or add mod folders, `.patch_N` files, or their
+`.stream`/`.gpu_resources` companions; each folder becomes a batch and each
+file selects only its own group. The **Settings** page holds the Helldivers II
+install root (the `data` folder is derived internally), language, and theme /
+accent color.
 
 ### CLI
 
 ```console
-hd2-repatcher --game "C:\Program Files (x86)\Steam\steamapps\common\Helldivers 2\data" C:\path\to\mods\SomeMod
+hd2-repatcher --game "C:\Program Files (x86)\Steam\steamapps\common\Helldivers 2" C:\path\to\mods\SomeMod\mod.patch_0
 ```
 
-- `-g`/`--game PATH` — path to the Helldivers II `data` folder. Only needs to be
-  passed once; it's cached for future runs. Requires at least one `PATCH_FOLDER`.
-- `--no-game-path-caching` — don't save or overwrite the cached game data path.
-- `PATCH_FOLDER [PATCH_FOLDER ...]` — one or more folders of patch files to update.
+- `-g`/`--game PATH` — path to the Helldivers II install root. The app uses its
+  `data` child. It only needs to be passed once; it's cached for future runs.
+  Requires at least one `PATCH_PATH`.
+- `--no-game-path-caching` — don't save or overwrite the cached game install root.
+- `PATCH_PATH [PATCH_PATH ...]` — patch files, `.stream`/`.gpu_resources`
+  companions, or folders. A file input selects only its matching group; a
+  folder input processes each group independently.
 
-Once the game path is cached you can omit `-g`, and drag-and-drop one or more mod
-folders directly onto the executable. The exit code is non-zero if any corrupted
-patch files were found.
+Once the game root is cached you can omit `-g`, and drag-and-drop one or more mod
+folders or patch files directly onto the executable. The exit code is non-zero
+if any group fails. Patching is always in place; the CLI has no output-copy or
+dry-run mode.
 
 On Windows the app is a windowed binary with no console of its own: CLI mode
 only activates when it's launched from a terminal that already has a console
@@ -78,16 +87,36 @@ attached. Double-click or drag-and-drop onto the executable never spawns a
 console — it always opens the GUI, with any dropped paths seeded in exactly
 as if they'd been dropped onto a running window.
 
-If you're integrating this into a mod manager, always pass the game data path
-explicitly via `-g`/`--game` on every invocation rather than relying on the
-cache.
+If you're integrating this into a mod manager, always pass the game install
+root explicitly via `-g`/`--game` on every invocation rather than relying on
+the cache, and patch the mod source through the manager so its file tracking
+stays consistent.
+
+### Patch groups
+
+The main `.patch_N` file is required. A matching `<main>.stream` or
+`<main>.gpu_resources` file is included automatically when present; a sidecar
+selected directly resolves back to its main file. If the main TOC references a
+missing required sidecar, the group is rejected before any file is changed.
+
+Unit, audio, and mixed groups are staged and validated before replacement. The
+original main filename, including its `.patch_N` suffix, is retained. Existing
+`.gpu_resources` files are never regenerated, and an existing `.stream` is
+replaced only when the audio patcher produces a new one. Direct-file operations
+do not scan neighbouring groups; folder operations still process each
+discovered group independently. No group is renamed or deleted.
 
 ## Settings
 
-The game data path, theme, and accent are stored in `settings.json` at the
-platform config location (`%LOCALAPPDATA%\hd2-repatcher\hd2-repatcher\` on
-Windows, `~/.config/hd2-repatcher/` on Linux). The `game_data_path` key is
-compatible with the earlier Python version of this tool.
+The game install root, language, theme, and accent are stored in `config.toml`
+at the platform config location (`%LOCALAPPDATA%\hd2-repatcher\hd2-repatcher\`
+on Windows, `~/.config/hd2-repatcher/` on Linux). This TOML configuration is
+separate from the legacy Python tool's JSON settings; existing `settings.json`
+files are not migrated.
+
+Settings also includes a guarded game-data action for patching one group
+directly inside the configured `data` directory. Mod-manager users should use
+their manager's source patching flow instead.
 
 ## Development
 
@@ -149,14 +178,15 @@ bun run dev` as above.
 
 ### Architecture
 
-- `crates/engine` — the native Rust patching engine (binary/bundle parsing, LZ4,
-  offset rewriting). Pure, no Tauri dependency, so it tests fast.
+- `crates/engine` — the native Rust patching engine (unit and audio binary /
+  bundle parsing, LZ4, offset rewriting). Pure, no Tauri dependency, so it
+  tests fast.
 - `src-tauri` — the Tauri app: `main.rs` dispatches to CLI or GUI, `cli.rs`
   mirrors the command-line interface, `commands.rs` exposes the engine to the UI.
 - `src` — the React 19 frontend (TanStack Router, Tailwind v4, Lingui, shadcn /
   Base UI style components).
-- `reference` — the original Python implementation, kept as the specification
-  oracle for the engine port (not shipped).
+- `reference` — the original Python implementations, kept as specification
+  oracles for the engine port (not shipped).
 
 ## Testing
 

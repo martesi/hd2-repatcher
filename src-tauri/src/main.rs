@@ -3,10 +3,10 @@
 // argv is treated as dropped paths for the GUI. Debug builds keep a console.
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
-mod audio;
 mod cli;
 mod commands;
 mod gui;
+mod patching;
 
 use clap::Parser;
 
@@ -14,7 +14,7 @@ fn main() {
     if cli::console::has_console() {
         let args = cli::Args::parse();
 
-        // Patch folders present -> headless CLI run; the GUI is never created.
+        // Patch paths present -> headless CLI run; the GUI is never created.
         if !args.patches.is_empty() {
             std::process::exit(cli::run(args));
         }
@@ -22,7 +22,7 @@ fn main() {
         // `--game` without a patch folder is an error, matching the Python CLI
         // (config-only invocations still need a folder to act on).
         if args.game.is_some() {
-            eprintln!("error: at least one PATCH_FOLDER is required with -g/--game");
+            eprintln!("error: at least one PATCH_PATH is required with -g/--game");
             std::process::exit(2);
         }
 

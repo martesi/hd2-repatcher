@@ -11,7 +11,8 @@ export function Home() {
   const batches = useStore((s) => s.batches)
   const addBatch = useStore((s) => s.addBatch)
   const config = useStore((s) => s.config)
-  const valid = config?.gameDataValid ?? false
+  const valid = config?.gameRootValid ?? false
+  const ready = valid && (config?.resourcesReady ?? false)
 
   function handleAdd(path: string) {
     const batch = addBatch(path)
@@ -54,7 +55,8 @@ export function Home() {
         </h1>
         <p className="text-sm text-muted-foreground">
           <Trans>
-            Drop a mod folder to update its unit resources against the current game data.
+            Drop a mod folder or patch file to update its unit resources and repatch its audio
+            resources against the current game data.
           </Trans>
         </p>
       </div>
@@ -64,7 +66,7 @@ export function Home() {
           <AlertIcon className="mt-0.5 shrink-0 text-destructive" />
           <div>
             <Trans>
-              No valid Helldivers II game data folder is set. Set it in{' '}
+              No valid Helldivers II install root is set. Set it in{' '}
               <Link to="/settings" className="font-medium underline">
                 Settings
               </Link>{' '}
@@ -74,7 +76,15 @@ export function Home() {
         </div>
       )}
 
-      <Dropzone onAdd={handleAdd} disabled={!valid} />
+      {valid && !ready && (
+        <div className="rounded-lg border border-border bg-muted/40 p-4 text-sm text-muted-foreground">
+          <Trans>
+            Game resources are indexing. Patch controls will be enabled when indexing finishes.
+          </Trans>
+        </div>
+      )}
+
+      <Dropzone onAdd={handleAdd} disabled={!ready} />
 
       <div>
         <h2 className="mb-3 text-sm font-medium text-muted-foreground">

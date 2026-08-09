@@ -15,8 +15,8 @@ msgstr ""
 
 #. placeholder {0}: batch.audio
 #: src/components/batch-list.tsx
-msgid "{0} audio delegated"
-msgstr "{0} audio delegated"
+msgid "{0} audio patched"
+msgstr "{0} audio patched"
 
 #. placeholder {0}: batch.patchesFound
 #: src/components/batch-list.tsx
@@ -51,13 +51,25 @@ msgstr "Accent"
 msgid "Add folder"
 msgstr "Add folder"
 
+#: src/components/dropzone.tsx
+msgid "Add patch"
+msgstr "Add patch"
+
 #: src/routes/settings.tsx
 msgid "Appearance"
 msgstr "Appearance"
 
 #: src/routes/settings.tsx
-msgid "Audio tool"
-msgstr "Audio tool"
+msgid "Audio patching"
+msgstr "Audio patching"
+
+#: src/routes/settings.tsx
+msgid "Audio patching is built in. The original audio patcher code came from <0>hd2-audio-modder</0>."
+msgstr "Audio patching is built in. The original audio patcher code came from <0>hd2-audio-modder</0>."
+
+#: src/components/setup-wizard.tsx
+msgid "Back"
+msgstr "Back"
 
 #: src/routes/settings.tsx
 msgid "Change…"
@@ -73,9 +85,21 @@ msgstr "Checked {0} of {1}"
 msgid "Choose a theme and accent color."
 msgstr "Choose a theme and accent color."
 
+#: src/components/setup-wizard.tsx
+msgid "Choose folder"
+msgstr "Choose folder"
+
 #: src/routes/settings.tsx
-msgid "Clear"
-msgstr "Clear"
+msgid "Choose game-data patch"
+msgstr "Choose game-data patch"
+
+#: src/routes/settings.tsx
+msgid "Choose the language used by the app."
+msgstr "Choose the language used by the app."
+
+#: src/components/setup-wizard.tsx
+msgid "Choose your language"
+msgstr "Choose your language"
 
 #: src/components/batch-list.tsx
 msgid "Corrupted files"
@@ -86,24 +110,24 @@ msgid "Done"
 msgstr "Done"
 
 #: src/components/dropzone.tsx
-msgid "Drag a mod folder here, or"
-msgstr "Drag a mod folder here, or"
+msgid "Drag a mod folder or patch file here, or choose one"
+msgstr "Drag a mod folder or patch file here, or choose one"
 
 #: src/routes/home.tsx
-msgid "Drop a mod folder to update its unit resources against the current game data."
-msgstr "Drop a mod folder to update its unit resources against the current game data."
+msgid "Drop a mod folder or patch file to update its unit resources and repatch its audio resources against the current game data."
+msgstr "Drop a mod folder or patch file to update its unit resources and repatch its audio resources against the current game data."
+
+#: src/components/setup-wizard.tsx
+msgid "Finish setup"
+msgstr "Finish setup"
 
 #: src/routes/settings.tsx
-msgid "Game data folder"
-msgstr "Game data folder"
+msgid "Game installation folder"
+msgstr "Game installation folder"
 
-#: src/routes/root.tsx
-msgid "Game data ready"
-msgstr "Game data ready"
-
-#: src/routes/root.tsx
-msgid "Game path not set"
-msgstr "Game path not set"
+#: src/routes/home.tsx
+msgid "Game resources are indexing. Patch controls will be enabled when indexing finishes."
+msgstr "Game resources are indexing. Patch controls will be enabled when indexing finishes."
 
 #: src/routes/root.tsx
 msgid "Home"
@@ -113,21 +137,34 @@ msgstr "Home"
 msgid "Indexing game data…"
 msgstr "Indexing game data…"
 
+#: src/components/setup-wizard.tsx
+msgid "Initial setup"
+msgstr "Initial setup"
+
 #: src/routes/settings.tsx
 msgid "Invalid"
 msgstr "Invalid"
 
+#: src/components/setup-wizard.tsx
 #: src/routes/settings.tsx
-msgid "Missing"
-msgstr "Missing"
+msgid "Language"
+msgstr "Language"
+
+#: src/components/setup-wizard.tsx
+msgid "Next"
+msgstr "Next"
 
 #: src/routes/home.tsx
-msgid "No valid Helldivers II game data folder is set. Set it in <0>Settings</0> before repatching."
-msgstr "No valid Helldivers II game data folder is set. Set it in <0>Settings</0> before repatching."
+msgid "No valid Helldivers II install root is set. Set it in <0>Settings</0> before repatching."
+msgstr "No valid Helldivers II install root is set. Set it in <0>Settings</0> before repatching."
 
 #: src/components/batch-list.tsx
 msgid "No work yet. Drop a mod folder above to start repatching."
 msgstr "No work yet. Drop a mod folder above to start repatching."
+
+#: src/routes/settings.tsx
+msgid "Patch game data"
+msgstr "Patch game data"
 
 #: src/components/batch-list.tsx
 msgid "Pending"
@@ -141,26 +178,46 @@ msgstr "Repatch mods"
 msgid "Repatching"
 msgstr "Repatching"
 
+#: src/routes/settings.tsx
+msgid "Select one game-data patch or companion to repatch its group in place. If you use a mod manager, patch the mod source through the manager instead."
+msgstr "Select one game-data patch or companion to repatch its group in place. If you use a mod manager, patch the mod source through the manager instead."
+
+#: src/components/setup-wizard.tsx
+msgid "Select the Helldivers II install folder. The app will use its `data` folder for unit and audio resources."
+msgstr "Select the Helldivers II install folder. The app will use its `data` folder for unit and audio resources."
+
+#: src/components/setup-wizard.tsx
+msgid "Select the language you want to use, then finish setup."
+msgstr "Select the language you want to use, then finish setup."
+
+#: src/routes/settings.tsx
+msgid "Set a valid game install root before patching game data."
+msgstr "Set a valid game install root before patching game data."
+
+#: src/components/setup-wizard.tsx
+msgid "Set up HD2 Repatcher"
+msgstr "Set up HD2 Repatcher"
+
+#: src/components/setup-wizard.tsx
+msgid "Setting up…"
+msgstr "Setting up…"
+
 #: src/routes/root.tsx
 #: src/routes/settings.tsx
 msgid "Settings"
 msgstr "Settings"
 
 #: src/routes/settings.tsx
-msgid "The external audio modding tool used to repatch audio mods, which this app cannot repatch itself. Optional — leave it unset if you have no audio mods."
-msgstr "The external audio modding tool used to repatch audio mods, which this app cannot repatch itself. Optional — leave it unset if you have no audio mods."
-
-#: src/routes/settings.tsx
-msgid "The Helldivers II `data` folder used as the source of current unit data."
-msgstr "The Helldivers II `data` folder used as the source of current unit data."
+msgid "The Helldivers II install root. The app derives its `data` folder for unit and audio resources."
+msgstr "The Helldivers II install root. The app derives its `data` folder for unit and audio resources."
 
 #: src/routes/settings.tsx
 msgid "Theme"
 msgstr "Theme"
 
 #: src/routes/root.tsx
-msgid "Unit mod repatcher"
-msgstr "Unit mod repatcher"
+msgid "Unit and audio mod repatcher"
+msgstr "Unit and audio mod repatcher"
 
 #: src/routes/settings.tsx
 msgid "Valid"

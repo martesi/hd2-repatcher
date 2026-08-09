@@ -3,7 +3,7 @@ name = "engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Native Rust port of the HD2 Repatcher unit-mod patching engine"
+description = "Native Rust engine for HD2 Repatcher unit and audio mods"
 
 [dependencies]
 serde = { workspace = true }
@@ -12,3 +12,4 @@ rayon = { workspace = true }
 lz4_flex = { workspace = true }
 dirs = { workspace = true }
 indexmap = { workspace = true }
+toml = { workspace = true }

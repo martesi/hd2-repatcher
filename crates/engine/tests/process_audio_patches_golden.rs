@@ -48,7 +48,7 @@ fn run_case(dir: &Path) {
     process_audio_patches(&patches_dir, &patch_paths, &resources)
         .unwrap_or_else(|e| panic!("[{name}] process_audio_patches failed: {e}"));
 
-    let got_path = patches_dir.join("9ba626afa44a3aa3.patch_0");
+    let got_path = patches_dir.join(&patch_names[0]);
     let expected_path = dir.join("expected/9ba626afa44a3aa3.patch_0");
     let got = std::fs::read(&got_path).unwrap_or_else(|e| panic!("[{name}] failed to read {}: {e}", got_path.display()));
     let expected = std::fs::read(&expected_path).unwrap();

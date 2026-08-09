@@ -9,6 +9,7 @@
 mod audio_resources;
 mod memstream;
 mod patch;
+mod patch_group;
 mod resources;
 mod slim;
 pub mod wwise;
@@ -17,6 +18,10 @@ pub mod settings;
 
 pub use audio_resources::AudioIndex;
 pub use patch::{update_patch_file, PatchOutcome, UnitData, UnitDataSource};
+pub use patch_group::{
+    find_patch_file_groups, find_patch_files, is_main_patch_file, resolve_patch_file_group,
+    PatchFileGroup, PatchFileGroupError,
+};
 pub use resources::GameResources;
 pub use slim::Slim;
 
@@ -32,9 +37,8 @@ pub const SLIM_MARKER_FILE: &str = "bundles.nxa";
 /// Type id that identifies a unit resource in a package TOC.
 pub const UNIT_TYPE_ID: u64 = 16187218042980615487;
 
-// Audio resource type ids (from the audio tool's `const.py`). A patch file that
-// carries any of these is an audio mod and is delegated to the external audio
-// tool rather than unit-patched here.
+// Audio resource type ids (from the original audio tool's `const.py`). A patch
+// file that carries any of these is handled by the native audio merger.
 /// Wwise soundbank resource.
 pub const WWISE_BANK: u64 = 6006249203084351385;
 /// Wwise streamed-audio resource.
@@ -47,7 +51,7 @@ pub const TEXT_BANK: u64 = 979299457696010195;
 pub const BINK_VIDEO: u64 = 6838244362054241717;
 
 /// True when `type_id` is one of the audio resource types.
-fn is_audio_type_id(type_id: u64) -> bool {
+pub fn is_audio_type_id(type_id: u64) -> bool {
     matches!(
         type_id,
         WWISE_BANK | WWISE_STREAM | WWISE_DEP | TEXT_BANK | BINK_VIDEO
@@ -126,71 +130,16 @@ pub fn is_valid_game_data_path(path: &Path) -> bool {
         && (path.join(LEGACY_MARKER_FILE).exists() || path.join(SLIM_MARKER_FILE).exists())
 }
 
-/// Recursively collects patch files under `directory`. Mirrors the Python rule:
-/// a file counts when its extension contains the substring `patch` (e.g.
-/// `.patch`, `.patch_0`).
-pub fn find_patch_files(directory: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    collect_patch_files(directory, &mut out);
-    out
+/// Resolves the install root selected by users to Helldivers II's data folder.
+pub fn game_data_path(game_root: &Path) -> PathBuf {
+    game_root.join("data")
 }
 
-fn collect_patch_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_patch_files(&path, out);
-        } else if path
-            .extension()
-            .map(|e| e.to_string_lossy().contains("patch"))
-            .unwrap_or(false)
-        {
-            out.push(path);
-        }
-    }
-}
-
-/// Walks `root` and returns, for every directory that *directly* contains at
-/// least one audio-carrying patch file, that directory paired with its sorted
-/// audio patch files. Each group is one [`process_audio_patches`] call: the
-/// native merge, like the external audio tool it replaces, is non-recursive
-/// and combines everything in a directory into one output patch.
-pub fn find_audio_dirs(root: &Path) -> Vec<(PathBuf, Vec<PathBuf>)> {
-    let mut out = Vec::new();
-    collect_audio_dirs(root, &mut out);
-    out
-}
-
-fn collect_audio_dirs(dir: &Path, out: &mut Vec<(PathBuf, Vec<PathBuf>)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut audio_here: Vec<PathBuf> = Vec::new();
-    let mut subdirs: Vec<PathBuf> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            subdirs.push(path);
-        } else if path
-            .extension()
-            .map(|e| e.to_string_lossy().contains("patch"))
-            .unwrap_or(false)
-            && matches!(classify_patch_file(&path), PatchKind::Audio | PatchKind::UnitAndAudio)
-        {
-            audio_here.push(path);
-        }
-    }
-    if !audio_here.is_empty() {
-        audio_here.sort();
-        out.push((dir.to_path_buf(), audio_here));
-    }
-    subdirs.sort();
-    for sub in subdirs {
-        collect_audio_dirs(&sub, out);
-    }
+/// True when `path` is a Helldivers II install root containing a valid `data`
+/// folder. The lower-level [`is_valid_game_data_path`] remains available for
+/// callers that already operate on the derived data directory.
+pub fn is_valid_game_root_path(path: &Path) -> bool {
+    path.is_dir() && is_valid_game_data_path(&game_data_path(path))
 }
 
 /// Aggregated result of processing a folder of patch files. Field names mirror
@@ -204,13 +153,9 @@ pub struct PatchResult {
     /// Patch files that carry audio resources; they no longer land in
     /// `no_units`.
     pub audio: Vec<String>,
-    /// Audio-carrying patch files successfully merged into the game data by
-    /// [`process_audio_patches`]. Populated by the `src-tauri` layer (`cli.rs`,
-    /// `commands.rs`), which groups `audio`/`no_units`-adjacent files via
-    /// [`find_audio_dirs`] and calls [`process_audio_patches`] per group —
-    /// not by [`process_patch_files`]/[`process_patch_folder`] themselves,
-    /// since those stay generic over [`UnitDataSource`] alone (audio merging
-    /// needs a concrete [`GameResources`] for its archive index).
+    /// Retained for compatibility with the lower-level aggregation API. The
+    /// application-level one-group-at-a-time workflow fills its own summaries
+    /// after transactional processing.
     pub audio_updated: Vec<String>,
     /// Audio-carrying patch files that failed to merge, paired with the
     /// error message. See [`Self::audio_updated`]'s note on wiring.
@@ -266,14 +211,10 @@ pub fn process_patch_folder(directory: &Path, source: &(impl UnitDataSource + Sy
     result
 }
 
-/// Native replacement for the external audio tool's headless `run_patch_cli`
-/// (`hd2-audio-modder/audio_modder.py:3647-3737`): merges every audio-carrying
-/// `.patch_N` file in `patches` (a same-directory group — see
-/// `find_audio_dirs`-style grouping, not yet wired into
-/// [`process_patch_files`]/[`process_patch_folder`], see [`PatchResult`]'s
-/// doc) into the base game archives they touch, then writes one combined
-/// `9ba626afa44a3aa3.patch_0` into `dir`. `patches` need not be pre-sorted —
-/// this sorts by path itself, matching Python's `sorted(os.listdir(...))`.
+/// Native implementation of the original audio tool's headless `run_patch_cli`
+/// (`hd2-audio-modder/audio_modder.py:3647-3737`). The output keeps the first
+/// selected main filename. Patch operations use one main file per call; the
+/// slice remains for compatibility with lower-level multi-input callers.
 ///
 /// Resolves each touched soundbank's containing base archive via
 /// `resources.audio_index()` (this port's replacement for the external
@@ -283,6 +224,25 @@ pub fn process_patch_folder(directory: &Path, source: &(impl UnitDataSource + Sy
 /// text-bank strings also pulls in the base `9ba626afa44a3aa3` archive
 /// (upstream hardcodes the same archive for text banks).
 pub fn process_audio_patches(dir: &Path, patches: &[PathBuf], resources: &GameResources) -> Result<(), String> {
+    let output_filename = patches
+        .first()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .ok_or("audio patch group has no valid main filename")?;
+    process_audio_patches_to(dir, patches, resources, output_filename)
+}
+
+/// Merges the supplied audio patch files and writes the result using exactly
+/// `output_filename`. Callers should pass one [`PatchFileGroup::main`] at a
+/// time when performing an in-place repatch; the function accepts a slice so
+/// the lower-level multi-input audio behavior remains available to fixtures
+/// and library users.
+pub fn process_audio_patches_to(
+    dir: &Path,
+    patches: &[PathBuf],
+    resources: &GameResources,
+    output_filename: &str,
+) -> Result<(), String> {
     let mut sorted: Vec<&PathBuf> = patches.iter().collect();
     sorted.sort();
 
@@ -316,7 +276,7 @@ pub fn process_audio_patches(dir: &Path, patches: &[PathBuf], resources: &GameRe
         // false is a genuine load failure — an indexed package that's gone
         // from disk, or one whose toc/stream data won't parse. Bail rather
         // than merge into a pool that's missing the resources this patch
-        // targets: the callers delete the inputs a successful run consumed.
+        // targets.
         if !mod_.load_base_archive(resources.slim(), archive_name) {
             return Err(format!(
                 "failed to load base game archive '{archive_name}'; cannot build a correct patch"
@@ -333,8 +293,7 @@ pub fn process_audio_patches(dir: &Path, patches: &[PathBuf], resources: &GameRe
     // can't resolve — `AudioIndex` maps soundbank ids only, so a group of
     // `WWISE_STREAM`-only files (still audio per `is_audio_type_id`) loads
     // no base archive at all, swaps nothing, and would write a
-    // resource-less patch that the callers then treat as a green light to
-    // delete the originals. Videos are the one legitimately archive-less
+    // resource-less patch. Videos are the one legitimately archive-less
     // case and they do flag `modified`, so this guard leaves them alone.
     if !mod_.has_modified_resources() {
         return Err(format!(
@@ -349,6 +308,20 @@ pub fn process_audio_patches(dir: &Path, patches: &[PathBuf], resources: &GameRe
         ));
     }
 
-    mod_.write_patch(dir, Some("9ba626afa44a3aa3.patch_0"))
+    mod_.write_patch(dir, Some(output_filename))
         .map_err(|e| format!("failed to write patch to '{}': {e}", dir.display()))
+}
+
+/// Convenience wrapper for a single audio patch whose output keeps its main
+/// filename. The caller is responsible for staging the group when atomic
+/// replacement is required.
+pub fn process_audio_patch_file(path: &Path, resources: &GameResources) -> Result<(), String> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("patch '{}' has no parent directory", path.display()))?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("patch '{}' has a non-UTF-8 filename", path.display()))?;
+    process_audio_patches_to(dir, &[path.to_path_buf()], resources, filename)
 }
