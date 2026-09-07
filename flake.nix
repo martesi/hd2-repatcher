@@ -8,15 +8,20 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    bun2nix = {
+      url = "github:nix-community/bun2nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, bun2nix }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
 
-        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+        packageRustToolchain = pkgs.rust-bin.stable.latest.default;
+        rustToolchain = packageRustToolchain.override {
           extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
         };
 
@@ -78,8 +83,71 @@
           targets = [ "x86_64-pc-windows-gnu" ];
         };
         mingw = pkgs.pkgsCross.mingwW64;
+
+        bun2nixPkg = bun2nix.packages.${system}.default;
+        appVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+
+        hd2-repatcher = pkgs.stdenv.mkDerivation {
+          pname = "hd2-repatcher";
+          version = appVersion;
+          src = ./.;
+
+          cargoDeps = pkgs.rustPlatform.importCargoLock {
+            lockFile = ./Cargo.lock;
+          };
+          bunDeps = bun2nixPkg.fetchBunDeps {
+            bunNix = ./bun.nix;
+          };
+
+          nativeBuildInputs = [
+            packageRustToolchain
+            pkgs.rustPlatform.cargoSetupHook
+            bun2nixPkg.hook
+            pkgs.bun
+            pkgs.pkg-config
+            pkgs.wrapGAppsHook3
+          ];
+          buildInputs = tauriLibs;
+
+          buildPhase = ''
+            runHook preBuild
+            bun run build:web
+            cargo build --release --locked -p hd2-repatcher
+            runHook postBuild
+          '';
+
+          installPhase = ''
+            runHook preInstall
+            install -Dm755 target/release/hd2-repatcher $out/bin/hd2-repatcher
+            runHook postInstall
+          '';
+
+          preFixup = ''
+            gappsWrapperArgs+=(
+              --set-default WEBKIT_DISABLE_COMPOSITING_MODE 1
+              --set-default __EGL_VENDOR_LIBRARY_DIRS ${pkgs.mesa}/share/glvnd/egl_vendor.d
+              --set-default GIO_MODULE_DIR ${pkgs.glib-networking}/lib/gio/modules/
+            )
+          '';
+
+          meta = {
+            description = "Repatches Helldivers II unit and audio mods after a game update";
+            license = pkgs.lib.licenses.mit;
+            mainProgram = "hd2-repatcher";
+            platforms = pkgs.lib.platforms.linux;
+          };
+        };
       in
       {
+        packages = pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          default = hd2-repatcher;
+          inherit hd2-repatcher;
+        };
+
+        apps = pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          default = flake-utils.lib.mkApp { drv = hd2-repatcher; };
+        };
+
         devShells.default = pkgs.mkShell {
           packages = devPackages;
           shellHook = tauriHook;

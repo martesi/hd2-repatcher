@@ -51,6 +51,38 @@ It is a single [Tauri](https://tauri.app) app with a native Rust engine:
    Helldivers II install root and language. You can change these later in
    **Settings** (or pass `-g`/`--game` on the CLI).
 
+### Nix / NixOS
+
+The flake exposes the native Linux package as `packages.x86_64-linux.default`,
+including the GTK/WebKitGTK runtime closure. Run it directly from GitHub:
+
+```console
+nix run github:martesi/hd2-repatcher
+```
+
+To install it from another flake, add this repository as an input:
+
+```nix
+{
+  inputs.hd2-repatcher.url = "github:martesi/hd2-repatcher";
+}
+```
+
+Then add the package wherever that flake defines packages, for example in a
+NixOS module:
+
+```nix
+{ inputs, pkgs, ... }: {
+  environment.systemPackages = [
+    inputs.hd2-repatcher.packages.${pkgs.system}.default
+  ];
+}
+```
+
+The package output is currently available for `x86_64-linux`. It does not
+require `nix-ld`; Nix supplies the dynamic linker and Tauri's Linux runtime
+libraries through the package closure.
+
 ## Usage
 
 ### GUI
