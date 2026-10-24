@@ -11,7 +11,9 @@
 //! phases.
 
 pub mod archive;
+mod archive_writer;
 pub mod audio_source;
+mod bank;
 pub mod bank_parser;
 pub mod hierarchy;
 pub mod mod_;

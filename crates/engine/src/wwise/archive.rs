@@ -7,6 +7,8 @@ use std::path::Path;
 
 use indexmap::IndexMap;
 
+use super::bank::rev_audio_media_index_id;
+pub use super::bank::WwiseBank;
 use crate::memstream::MemoryStream;
 use crate::wwise::audio_source::{
     AudioSource, WwiseDep, WwiseStream, STREAM_TYPE_BANK, STREAM_TYPE_PREFETCH, STREAM_TYPE_STREAM,
@@ -38,20 +40,6 @@ fn posix_dirname(path: &str) -> &str {
 }
 
 const ARCHIVE_MAGIC: u32 = 0xF000_0011;
-
-fn pad_to_16_byte_align(data: &[u8]) -> Vec<u8> {
-    let new_len = data.len().div_ceil(16) * 16;
-    let mut out = data.to_vec();
-    out.resize(new_len, 0);
-    out
-}
-
-fn hex_decode(s: &str) -> Vec<u8> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-        .collect()
-}
 
 /// Port of `TocHeader`: the 80-byte per-resource TOC entry.
 #[derive(Debug, Clone)]
@@ -129,174 +117,6 @@ impl TocHeader {
     }
 }
 
-/// Port of `WwiseBank`.
-#[derive(Debug, Clone)]
-pub struct WwiseBank {
-    pub file_id: u64,
-    pub bank_header: Vec<u8>,
-    pub bank_misc_data: Vec<u8>,
-    pub modified: bool,
-    modified_count: u32,
-    pub dep: WwiseDep,
-    pub hierarchy: WwiseHierarchy,
-    /// This bank's own DIDX media ids (`None` if it had no DIDX chunk at
-    /// all). `generate` uses this to gate which `Sound`/`MusicTrack`
-    /// sources it re-embeds — see the comment there for the exact (and
-    /// slightly quirky) None/empty/non-empty semantics it replicates from
-    /// Python.
-    pub media_index: Option<Vec<u32>>,
-}
-
-impl WwiseBank {
-    pub fn id(&self) -> u64 {
-        self.file_id
-    }
-
-    pub fn raise_modified(&mut self) {
-        self.modified = true;
-        self.modified_count += 1;
-    }
-
-    pub fn lower_modified(&mut self) {
-        if self.modified {
-            self.modified_count -= 1;
-            if self.modified_count == 0 {
-                self.modified = false;
-            }
-        }
-    }
-
-    /// `WwiseBank.import_hierarchy`: merges a patch file's HIRC field
-    /// changes into this bank's own hierarchy, then raises this bank's
-    /// `modified` flag if the merge actually changed anything — see
-    /// [`WwiseHierarchy::import_hierarchy`]'s doc comment for why this
-    /// two-step (merge, then check-and-raise) shape replaces real
-    /// upstream's per-entry `soundbanks` back-reference callback.
-    pub fn import_hierarchy(&mut self, new_hierarchy: &WwiseHierarchy) {
-        if self.hierarchy.import_hierarchy(new_hierarchy) {
-            self.raise_modified();
-        }
-    }
-
-    /// `WwiseBank.generate`: regenerates the bank blob from its hierarchy,
-    /// including the DIDX/DATA re-embedding loop over `Sound`'s and
-    /// `MusicTrack`'s audio sources.
-    pub fn generate(&self, audio_sources: &IndexMap<u64, AudioSource>) -> Vec<u8> {
-        let mut data = self.bank_header.clone();
-
-        let mut offset: u32 = 0;
-        let mut didx_array: Vec<[u8; 12]> = Vec::new();
-        let mut data_array: Vec<&[u8]> = Vec::new();
-        let mut added_sources: HashSet<u32> = HashSet::new();
-
-        // Matches Python's `get_sounds() + get_music_tracks()`.
-        let sound_sources = self.hierarchy.sounds().into_iter().map(|s| &s.sources);
-        let track_sources = self.hierarchy.music_tracks().into_iter().map(|m| &m.sources);
-        for sources in sound_sources.chain(track_sources) {
-            for source in sources {
-                if source.plugin_id == VORBIS {
-                    // Python: `if self.media_index and source_id not in
-                    // self.media_index: continue` — an *empty* (but present)
-                    // media_index is falsy in Python, so it does NOT filter
-                    // anything out (this only matters for a bank whose DIDX
-                    // chunk existed but had zero entries). Replicated as-is.
-                    let Some(media_index) = &self.media_index else {
-                        continue;
-                    };
-                    if !media_index.is_empty() && !media_index.contains(&source.source_id) {
-                        continue;
-                    }
-
-                    let Some(audio) = audio_sources.get(&(source.source_id as u64)) else {
-                        continue;
-                    };
-
-                    if source.stream_type as u32 == STREAM_TYPE_PREFETCH && !added_sources.contains(&source.source_id) {
-                        let mem_size = source.mem_size as usize;
-                        data_array.push(&audio.data[..mem_size.min(audio.data.len())]);
-                        didx_array.push(didx_entry(source.source_id, offset, source.mem_size));
-                        offset += source.mem_size;
-                        added_sources.insert(source.source_id);
-                    } else if source.stream_type as u32 == STREAM_TYPE_BANK && !added_sources.contains(&source.source_id) {
-                        data_array.push(&audio.data);
-                        didx_array.push(didx_entry(source.source_id, offset, audio.data.len() as u32));
-                        offset += audio.data.len() as u32;
-                        added_sources.insert(source.source_id);
-                    }
-                } else if source.plugin_id == REV_AUDIO {
-                    let Some(entry) = self.hierarchy.get_entry(source.source_id) else {
-                        continue;
-                    };
-                    let fx_data = entry.get_data();
-                    let Some(media_index_id) = rev_audio_media_index_id(&fx_data) else {
-                        continue;
-                    };
-                    let Some(audio) = audio_sources.get(&(media_index_id as u64)) else {
-                        continue;
-                    };
-
-                    // Upstream's asymmetry, kept verbatim: this branch tests
-                    // membership on `source.source_id` (the CustomFX entry's
-                    // id) but records `media_index_id`
-                    // (`audio_core.py:316-320`), so a second entry pointing
-                    // at the same REV_AUDIO source re-emits its DIDX entry
-                    // and payload under a duplicate id. Keying both sides on
-                    // `media_index_id` would dedup it and produce a
-                    // byte-different bank.
-                    if source.stream_type as u32 == STREAM_TYPE_BANK && !added_sources.contains(&source.source_id) {
-                        data_array.push(&audio.data);
-                        didx_array.push(didx_entry(media_index_id, offset, audio.data.len() as u32));
-                        offset += audio.data.len() as u32;
-                        added_sources.insert(media_index_id);
-                    }
-                }
-            }
-        }
-
-        if !didx_array.is_empty() {
-            data.extend_from_slice(b"DIDX");
-            data.extend_from_slice(&((didx_array.len() * 12) as u32).to_le_bytes());
-            for entry in &didx_array {
-                data.extend_from_slice(entry);
-            }
-            data.extend_from_slice(b"DATA");
-            let total: u32 = data_array.iter().map(|d| d.len() as u32).sum();
-            data.extend_from_slice(&total.to_le_bytes());
-            for chunk in &data_array {
-                data.extend_from_slice(chunk);
-            }
-        }
-
-        let hierarchy_section = self.hierarchy.get_data();
-        data.extend_from_slice(b"HIRC");
-        data.extend_from_slice(&(hierarchy_section.len() as u32).to_le_bytes());
-        data.extend_from_slice(&hierarchy_section);
-        data.extend_from_slice(&self.bank_misc_data);
-        data
-    }
-}
-
-fn didx_entry(id: u32, offset: u32, size: u32) -> [u8; 12] {
-    let mut out = [0u8; 12];
-    out[0..4].copy_from_slice(&id.to_le_bytes());
-    out[4..8].copy_from_slice(&offset.to_le_bytes());
-    out[8..12].copy_from_slice(&size.to_le_bytes());
-    out
-}
-
-/// `int.from_bytes(fx_data[19+plugin_param_size:23+plugin_param_size], ...)`:
-/// a `REV_AUDIO` source's `source_id` points at an opaque `FxCustom` HIRC
-/// entry; the media index id it actually needs lives at a fixed offset past
-/// that entry's plugin-param blob, read straight out of its raw
-/// `get_data()` bytes (type+size+id+misc header included) rather than a
-/// dedicated parsed structure — `FxCustom` (0x11) is one of the many HIRC
-/// types that stay opaque even in the real upstream tool.
-fn rev_audio_media_index_id(fx_data: &[u8]) -> Option<u32> {
-    let plugin_param_size = u32::from_le_bytes(fx_data.get(13..17)?.try_into().unwrap()) as usize;
-    let bytes = fx_data.get(19 + plugin_param_size..23 + plugin_param_size)?;
-    Some(u32::from_le_bytes(bytes.try_into().unwrap()))
-}
-
 /// Port of `GameArchive`.
 #[derive(Debug, Default, Clone)]
 pub struct GameArchive {
@@ -324,10 +144,7 @@ impl GameArchive {
         if toc_data.is_empty() {
             return None;
         }
-        let mut archive = GameArchive {
-            name,
-            ..Default::default()
-        };
+        let mut archive = GameArchive { name, ..Default::default() };
         archive.load(toc_data, stream_data);
         Some(archive)
     }
@@ -376,23 +193,21 @@ impl GameArchive {
             let header = TocHeader::read(&mut toc);
 
             if header.type_id == WWISE_STREAM {
+                toc.seek(header.toc_data_offset as usize);
+                let mut resource_header = [0; 8];
+                resource_header.copy_from_slice(toc.read(8));
                 let start = header.stream_file_offset as usize;
                 let end = start + header.stream_size as usize;
-                let mut audio = AudioSource {
-                    stream_type: STREAM_TYPE_STREAM,
-                    ..Default::default()
-                };
+                let mut audio = AudioSource { stream_type: STREAM_TYPE_STREAM, ..Default::default() };
                 audio.set_data(stream_data[start..end].to_vec(), false);
                 audio.resource_id = header.file_id;
-                let wstream = WwiseStream {
-                    file_id: header.file_id,
-                    audio_source: audio,
-                    modified: false,
-                };
+                let wstream =
+                    WwiseStream { file_id: header.file_id, resource_header, audio_source: audio, modified: false };
                 self.wwise_streams.insert(wstream.id(), wstream);
             } else if header.type_id == WWISE_BANK {
                 toc.seek(header.toc_data_offset as usize);
-                toc.advance(16);
+                let resource_tag = toc.read_u32();
+                toc.advance(12);
                 let bank_bytes = toc.read((header.toc_data_size - 16) as usize).to_vec();
                 let parser = BankParser::load(&bank_bytes);
 
@@ -403,11 +218,8 @@ impl GameArchive {
                 bank_header.extend_from_slice(&bkhd);
 
                 let bank_version_raw = u32::from_le_bytes(bkhd[0..4].try_into().unwrap());
-                let version = if (bank_version_raw ^ BANK_VERSION_KEY) == 154 {
-                    BankVersion::V154
-                } else {
-                    BankVersion::V140
-                };
+                let version =
+                    if (bank_version_raw ^ BANK_VERSION_KEY) == 154 { BankVersion::V154 } else { BankVersion::V140 };
 
                 let hierarchy = if parser.chunks.contains_key("HIRC") {
                     WwiseHierarchy::load(version, parser.get_chunk("HIRC"))
@@ -454,6 +266,7 @@ impl GameArchive {
                 let dep = WwiseDep::synthesized(header.file_id, header.file_id);
                 let bank = WwiseBank {
                     file_id: header.file_id,
+                    resource_tag,
                     bank_header,
                     bank_misc_data,
                     modified: false,
@@ -478,7 +291,8 @@ impl GameArchive {
             } else if header.type_id == BINK_VIDEO {
                 let start = header.stream_file_offset as usize;
                 let end = start + header.stream_size as usize;
-                let video = VideoSource::from_original(header.file_id, header.stream_size, stream_data[start..end].to_vec());
+                let video =
+                    VideoSource::from_original(header.file_id, header.stream_size, stream_data[start..end].to_vec());
                 self.video_sources.insert(video.id(), video);
             }
         }
@@ -539,7 +353,8 @@ impl GameArchive {
                         continue;
                     }
                     let is_bank = source.stream_type as u32 == STREAM_TYPE_BANK;
-                    let is_stream = source.stream_type as u32 == STREAM_TYPE_STREAM || source.stream_type as u32 == STREAM_TYPE_PREFETCH;
+                    let is_stream = source.stream_type as u32 == STREAM_TYPE_STREAM
+                        || source.stream_type as u32 == STREAM_TYPE_PREFETCH;
                     if !is_bank && !is_stream {
                         continue;
                     }
@@ -591,173 +406,5 @@ impl GameArchive {
         for audio in resolved {
             self.audio_sources.insert(audio.short_id as u64, audio);
         }
-    }
-
-    fn write_type_header(toc: &mut Vec<u8>, entry_type: u64, num_entries: usize) {
-        if num_entries > 0 {
-            toc.extend_from_slice(&0u64.to_le_bytes());
-            toc.extend_from_slice(&entry_type.to_le_bytes());
-            toc.extend_from_slice(&(num_entries as u64).to_le_bytes());
-            toc.extend_from_slice(&16u32.to_le_bytes());
-            toc.extend_from_slice(&64u32.to_le_bytes());
-        }
-    }
-
-    /// `GameArchive.to_file`: serializes this archive back into `<dir>/<name>`
-    /// (plus a `.stream` companion when there's any streamed/video payload).
-    pub fn to_file(&self, dir: &Path) -> std::io::Result<()> {
-        let deps: Vec<&WwiseDep> = self.wwise_banks.values().map(|b| &b.dep).filter(|d| !d.skip).collect();
-        let num_files =
-            self.wwise_streams.len() + self.wwise_banks.len() + deps.len() + self.text_banks.len() + self.video_sources.len();
-        let num_types = [
-            !self.wwise_streams.is_empty(),
-            !self.wwise_banks.is_empty(),
-            !self.text_banks.is_empty(),
-            !self.video_sources.is_empty(),
-            !deps.is_empty(),
-        ]
-        .into_iter()
-        .filter(|b| *b)
-        .count();
-
-        let mut toc: Vec<u8> = Vec::new();
-        toc.extend_from_slice(&self.magic.to_le_bytes());
-        toc.extend_from_slice(&(num_types as u32).to_le_bytes());
-        toc.extend_from_slice(&(num_files as u32).to_le_bytes());
-        toc.extend_from_slice(&self.unknown.to_le_bytes());
-        let mut unk4 = self.unk4_data.clone();
-        unk4.resize(56, 0);
-        toc.extend_from_slice(&unk4);
-
-        Self::write_type_header(&mut toc, WWISE_STREAM, self.wwise_streams.len());
-        Self::write_type_header(&mut toc, WWISE_BANK, self.wwise_banks.len());
-        Self::write_type_header(&mut toc, WWISE_DEP, deps.len());
-        Self::write_type_header(&mut toc, TEXT_BANK, self.text_banks.len());
-        Self::write_type_header(&mut toc, BINK_VIDEO, self.video_sources.len());
-
-        let mut toc_data_offset = toc.len() as u64 + 80 * num_files as u64 + 8;
-        let mut stream_file_offset = 0u64;
-
-        let mut toc_entries: Vec<TocHeader> = Vec::new();
-        let mut toc_data: Vec<u8> = Vec::new();
-        let mut stream_data: Vec<u8> = Vec::new();
-        let mut entry_index = 0u32;
-
-        for stream in self.wwise_streams.values() {
-            let raw = stream.get_data();
-            let s_data = pad_to_16_byte_align(raw);
-            let mut t_data = hex_decode("D82F767800000000");
-            t_data.extend_from_slice(&(raw.len() as u64).to_le_bytes());
-
-            toc_entries.push(TocHeader {
-                file_id: stream.id(),
-                type_id: WWISE_STREAM,
-                toc_data_offset,
-                stream_file_offset,
-                toc_data_size: 0x0C,
-                stream_size: raw.len() as u32,
-                entry_index,
-                ..Default::default()
-            });
-            stream_data.extend_from_slice(&s_data);
-            toc_data.extend_from_slice(&t_data);
-            entry_index += 1;
-            stream_file_offset += s_data.len() as u64;
-            toc_data_offset += 16;
-        }
-
-        for bank in self.wwise_banks.values() {
-            let bank_data = bank.generate(&self.audio_sources);
-            toc_entries.push(TocHeader {
-                file_id: bank.id(),
-                type_id: WWISE_BANK,
-                toc_data_offset,
-                stream_file_offset,
-                toc_data_size: bank_data.len() as u32 + 16,
-                entry_index,
-                ..Default::default()
-            });
-            let mut wrapped = hex_decode("D82F7678");
-            wrapped.extend_from_slice(&(bank_data.len() as u32).to_le_bytes());
-            wrapped.extend_from_slice(&bank.id().to_le_bytes());
-            wrapped.extend_from_slice(&pad_to_16_byte_align(&bank_data));
-            toc_data_offset += wrapped.len() as u64;
-            toc_data.extend_from_slice(&wrapped);
-            entry_index += 1;
-        }
-
-        for text_bank in self.text_banks.values() {
-            let text_data = text_bank.generate();
-            toc_entries.push(TocHeader {
-                file_id: text_bank.id(),
-                type_id: TEXT_BANK,
-                toc_data_offset,
-                stream_file_offset,
-                toc_data_size: text_data.len() as u32,
-                entry_index,
-                ..Default::default()
-            });
-            let padded = pad_to_16_byte_align(&text_data);
-            toc_data_offset += padded.len() as u64;
-            toc_data.extend_from_slice(&padded);
-            entry_index += 1;
-        }
-
-        for dep in &deps {
-            let dep_data = dep.get_data();
-            toc_entries.push(TocHeader {
-                file_id: dep.file_id,
-                type_id: WWISE_DEP,
-                toc_data_offset,
-                stream_file_offset,
-                toc_data_size: dep_data.len() as u32,
-                entry_index,
-                ..Default::default()
-            });
-            let padded = pad_to_16_byte_align(&dep_data);
-            toc_data_offset += padded.len() as u64;
-            toc_data.extend_from_slice(&padded);
-            entry_index += 1;
-        }
-
-        for video in self.video_sources.values() {
-            let raw = video.get_data();
-            let s_data = pad_to_16_byte_align(raw);
-            let t_data = hex_decode("E9030000000000000000000000000000");
-
-            toc_entries.push(TocHeader {
-                file_id: video.id(),
-                type_id: BINK_VIDEO,
-                toc_data_offset,
-                stream_file_offset,
-                toc_data_size: 0x10,
-                stream_size: raw.len() as u32,
-                entry_index,
-                ..Default::default()
-            });
-            stream_data.extend_from_slice(&s_data);
-            toc_data.extend_from_slice(&t_data);
-            entry_index += 1;
-            stream_file_offset += s_data.len() as u64;
-            toc_data_offset += 16;
-        }
-
-        for entry in &toc_entries {
-            toc.extend_from_slice(&entry.get_data());
-        }
-        toc.resize(toc.len() + 8, 0);
-        toc.extend_from_slice(&toc_data);
-
-        let min_size = toc_entries.len() * 256;
-        if toc.len() < min_size {
-            toc.resize(min_size, 0);
-        }
-        std::fs::write(dir.join(&self.name), &toc)?;
-
-        if !stream_data.is_empty() {
-            std::fs::write(dir.join(format!("{}.stream", self.name)), &stream_data)?;
-        }
-
-        Ok(())
     }
 }
