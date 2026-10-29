@@ -31,6 +31,8 @@ fn headers(data: &[u8]) -> Vec<TocHeader> {
                 type_id: u64_at(p + 8),
                 toc_data_offset: u64_at(p + 16),
                 toc_data_size: u32_at(p + 56),
+                stream_file_offset: u64_at(p + 24),
+                stream_size: u32_at(p + 60),
                 ..Default::default()
             }
         })
@@ -157,5 +159,62 @@ fn old_mod_import_keeps_base_headers_in_combined_and_separate_output() {
         output[start..start + len].copy_from_slice(&oracle[start..start + len]);
     }
     assert_eq!(output, oracle, "audio payload or hierarchy changed beyond the resource wrapper");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn old_stream_replacement_keeps_base_wrapper_and_new_payload() {
+    let dir = work_dir("stream-swap");
+    let case = fixtures().join("mod_import_patch_stream_swap");
+    let base = dir.join("base");
+    let patches = dir.join("patches");
+    copy_dir(&case.join("base"), &base);
+    copy_dir(&case.join("patches"), &patches);
+
+    let base_file = base.join("5555555555555555");
+    let patch_file = patches.join("mod_patch_stream_swap.patch_0");
+    let mut expected = HashMap::new();
+    set_tags(&base_file, &mut expected);
+
+    let input_toc = std::fs::read(&patch_file).unwrap();
+    let input_stream = std::fs::read(patches.join("mod_patch_stream_swap.patch_0.stream")).unwrap();
+    let replacement = headers(&input_toc).into_iter().find(|h| h.type_id == WWISE_STREAM).unwrap();
+    let replacement_bytes = &input_stream[replacement.stream_file_offset as usize
+        ..replacement.stream_file_offset as usize + replacement.stream_size as usize];
+    let base_toc = std::fs::read(&base_file).unwrap();
+    let original = headers(&base_toc).into_iter().find(|h| h.file_id == replacement.file_id && h.type_id == WWISE_STREAM).unwrap();
+    assert_ne!(original.stream_size, replacement.stream_size, "fixture must replace the stream with a different length");
+    assert_ne!(
+        &base_toc[original.toc_data_offset as usize..original.toc_data_offset as usize + 8],
+        &input_toc[replacement.toc_data_offset as usize..replacement.toc_data_offset as usize + 8],
+        "fixture must have a different stream resource header"
+    );
+
+    let mut mod_ = Mod::new();
+    assert!(mod_.load_archive_file(&base_file));
+    assert!(mod_.import_patch(&patch_file, true));
+    for (mode, output_name) in [("combined", "9ba626afa44a3aa3.patch_0"), ("separate", "5555555555555555.patch_0")] {
+        let output_dir = dir.join(mode);
+        std::fs::create_dir_all(&output_dir).unwrap();
+        if mode == "combined" {
+            mod_.write_patch(&output_dir, None).unwrap();
+        } else {
+            mod_.write_separate_patches(&output_dir).unwrap();
+        }
+        let output_file = output_dir.join(output_name);
+        let toc = std::fs::read(&output_file).unwrap();
+        let entry = headers(&toc).into_iter().find(|h| h.file_id == replacement.file_id && h.type_id == WWISE_STREAM).unwrap();
+        let prefix = expected.get(&(WWISE_STREAM, entry.file_id)).unwrap();
+        let offset = entry.toc_data_offset as usize;
+        assert_eq!(&toc[offset..offset + 8], prefix, "{mode}: stream tag and reserved bytes");
+        assert_eq!(entry.stream_size, replacement.stream_size, "{mode}: TOC stream length");
+        assert_eq!(u64::from_le_bytes(toc[offset + 8..offset + 16].try_into().unwrap()), replacement.stream_size as u64, "{mode}: resource stream length");
+        let stream = std::fs::read(output_dir.join(format!("{output_name}.stream"))).unwrap();
+        assert_eq!(
+            &stream[entry.stream_file_offset as usize..entry.stream_file_offset as usize + entry.stream_size as usize],
+            replacement_bytes,
+            "{mode}: imported audio payload"
+        );
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }
