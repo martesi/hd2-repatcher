@@ -107,6 +107,8 @@ impl WwiseDep {
 #[derive(Debug, Clone)]
 pub struct WwiseStream {
     pub file_id: u64,
+    /// Tag and reserved bytes from the game resource; length is regenerated.
+    pub resource_header: [u8; 8],
     pub audio_source: AudioSource,
     pub modified: bool,
 }

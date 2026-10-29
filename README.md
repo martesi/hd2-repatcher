@@ -2,6 +2,12 @@
 
 Repatches Helldivers II unit and audio mods after a game update.
 
+Audio repatching preserves each bank and stream's outer resource header from the installed
+game archive. Importing an older mod replaces its audio and supported hierarchy fields while
+keeping the game's resource tag; output lengths are recalculated. These outer tags are separate
+from the Wwise `BKHD` bank version. Legacy Python parity fixtures remain unchanged, with separate
+regression tests covering newer and mixed resource tags.
+
 When Helldivers II updates, unit and audio mod `.patch_N` files can go out of
 sync with the game's resources, causing them to fail to load. This tool updates
 one patch group at a time in place, preserving each main filename and its
