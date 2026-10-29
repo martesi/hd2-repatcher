@@ -983,7 +983,7 @@ checksum = "66b7e2430c6dff6a955451e2cfc438f09cea1965a9d6f87f7e3b90decc014099"
 
 [[package]]
 name = "engine"
-version = "0.4.0"
+version = "0.4.2"
 dependencies = [
  "dirs",
  "indexmap 2.14.0",
@@ -1540,7 +1540,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hd2-repatcher"
-version = "0.4.0"
+version = "0.4.2"
 dependencies = [
  "clap",
  "engine",
